@@ -13,9 +13,14 @@ WAVELENGHT = C / FREQUENCY
 class Coms_Metrics:
 
     def __init__(self):
-        self.end_to_end_PL = None
-        self.drones_SNR = None
-        self.drones_RP = None
+        self.end_to_end_PL = None  # Path Loss
+        self.link_SNRs = []  # List to store SNR values for each drone-to-drone link
+        self.drones_RP = []  # Received Power between drones
+        self.data_rate_Mbps = None  # Data rate in Mbps (Shannon Capacity)
+        self.latency = None  # Total end-to-end delay
+        self.packet_loss_rate = None  # Packet loss rate
+        self.throughput_Mbps = None  # Actual data rate (throughput)
+
 
 
     def update_end_to_end_PL(self, positions):
@@ -24,7 +29,7 @@ class Coms_Metrics:
 
     def update_drones_SNR(self, positions):
         # Update SNR based on positions
-        self.drones_SNR = calculate_snr(positions)
+        self.drones_SNR = calculate_snr_linear(positions)
 
     def update_drones_RP(self, positions):
         # Update received power based on positions
@@ -42,7 +47,16 @@ def calculate_coms_metrics(positions):
     
     # Return or display the collected metrics
     return coms_metrics
-    
+
+import math
+
+def calculate_distance(pos1, pos2):
+    """
+    Calculate the 2D distance between two positions.
+    pos1, pos2: Lists or tuples containing x and y coordinates.
+    """
+    return math.sqrt((pos1[0] - pos2[0]) ** 2 + (pos1[1] - pos2[1]) ** 2)
+ 
 
 def calculate_fspl(distance):
     """
@@ -58,22 +72,14 @@ def calculate_fspl(distance):
 
 def calculate_received_power(distance):
     """
-    Calculate the received power using the Friis transmission equation.
-    transmit_power: in dBm
+    Calculate the received power in dBm using the Friis transmission equation in dBm directly.
     distance: in meters
-    frequency: in Hz
     """
-    # Convert transmit power to milliwatts
-    transmit_power_mW = 10 ** (TRANSMIT_POWER / 10)
-     
-    # Friis transmission equation: Pr = Pt * (lambda / (4 * pi * d))^2
     if distance == 0:
-        return TRANSMIT_POWER  # If distance is zero, received power is equal to transmit power
-    
-    received_power_mW = transmit_power_mW * (WAVELENGHT / (4 * math.pi * distance)) ** 2
-    
-    # Convert received power back to dBm
-    received_power_dBm = 10 * math.log10(received_power_mW)
+        return TRANSMIT_POWER  # If distance is zero, received power equals transmit power
+
+    # Friis transmission equation in dBm 
+    received_power_dBm = TRANSMIT_POWER + 20 * math.log10(WAVELENGHT) - 20 * math.log10(4 * math.pi) - 20 * math.log10(distance)
     
     return received_power_dBm
 
@@ -116,3 +122,6 @@ def calculate_snr_linear(signal_power_watts, noise_power_watts):
     """
     return signal_power_watts / noise_power_watts
 
+def calculate_shannon_capacity(bandwidth, linear_snr):
+    # Shannon capacity formula
+    return bandwidth * math.log2(1 + linear_snr)

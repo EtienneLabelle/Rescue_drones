@@ -34,8 +34,30 @@ class GridEnvironment:
                     break
         return interference_sources
 
-  
+
     def render(self):
         """Prints the grid to the console."""
         render_grid = self.grid.copy()
         print(render_grid)
+
+        
+""" This could be good not sure yet
+class Simulation:
+    def __init__(self):
+        self.drones = []  # List of all drone objects
+        self.positions = []  # List of all drone positions (updated regularly)
+
+    def add_drone(self, drone):
+        self.drones.append(drone)
+        self.positions.append(drone.get_position())  # Initialize with starting position
+
+    def update_positions(self):
+        # Update the positions list based on drone movements
+        self.positions = [drone.get_position() for drone in self.drones]
+
+    def simulate_step(self):
+        # Move each drone (this is just an example, you'd have specific logic)
+        for drone in self.drones:
+            drone.move((1, 1))  # Example movement
+        self.update_positions()  # Update the position list after moving
+"""
