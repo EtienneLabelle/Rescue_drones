@@ -2,6 +2,7 @@ class Drone:
     def __init__(self, position, battery_level=100):
         self.pos = position
         self.battery_level = battery_level
+        self.id = 0 # id 0 is video drone 
 
     def move(self, step):
         # Update the position with a step in both x and y directions
@@ -18,18 +19,12 @@ class Drone:
 class Operator:
     def __init__(self, position=[0,0]):
         self.pos = position  # Operator is stationary
+        self.received_power=0
 
 
 
-def deploy_relay(video_drone, relay_drones):
-    """
-    Deploy a new relay drone, positioning it between the video drone and the last relay/operator.
-    """
-    last_point = [0,0] if not relay_drones else relay_drones[-1].pos
-    # Calculate the new relay position as the midpoint between the video drone and the last point
-    relay_position = [(video_drone.pos[0] + last_point[0]) / 2, 
-                      (video_drone.pos[1] + last_point[1]) / 2]
-
-    new_relay = Drone(position=relay_position)  # Initialize the new relay with a position
+def deploy_relay(relay_drones):
+    new_relay = Drone(position=[10,10]) 
+    new_relay.id = len(relay_drones)+1
     relay_drones.append(new_relay)
-    print(f"New Relay Drone deployed at position {relay_position}")
+    #print(f"New Relay Drone deployed Id:{new_relay.id}")

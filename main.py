@@ -1,5 +1,6 @@
-import coms
+from coms import calculate_sinr_with_fading
 from drones import Drone, Operator, deploy_relay
+from utils import calculate_distance
 
 FREQUENCY = 2.4e9  # 2.4 GHz
 BANDWIDTH = 20e6   # 20 MHz
@@ -13,39 +14,32 @@ video_drone = Drone([0, 0])  # Video drone starts at the same position
 relay_drones = []
 positions = []
 
+
 # Simulation loop
-for step in range(1, 2000):  # Simulate for longer distances
-    # Move the video drone by 10 units in x and 10 units in y
+for step in range(1, 2000):  
+
     video_drone.move([10, 10])  
+    if len(positions) == 0:  # If the list is empty
+        positions.append(video_drone.pos)  # Initialize the list with the first position
+    else:
+        positions[0] = video_drone.pos  # Replace the first position if it exists
 
-    # Determine the last communication point (either the operator or the last relay)
-    last_position = operator.pos if not relay_drones else relay_drones[-1].pos
-    
-    # Calculate the distance between the video drone and the last communication point (in 2D)
-    distance = coms.calculate_distance(video_drone.pos, last_position)
-    received_power = coms.calculate_received_power(distance)
+    for i, drone in enumerate(relay_drones):
+        drone.move([10,10])
+        positions[i+1] = drone.pos  # Update existing position
 
-    # Check if the signal strength drops below the threshold
-    if received_power < MIN_RECEIVE_POWER:
-        # Deploy a new relay to restore communication
-        deploy_relay(video_drone, relay_drones)
+    last_point = video_drone.pos if not relay_drones else relay_drones[-1].pos
+    distance = calculate_distance(operator.pos,last_point)
 
-    previous_position = operator.pos
-    for relay_drone in relay_drones:
-        relay_distance = coms.calculate_distance(relay_drone.pos, previous_position)
-        received_power = coms.calculate_received_power(relay_distance)
-        
-        if received_power < MIN_RECEIVE_POWER:
-            print(f"Communication failed at relay {relay_drone.pos:.2f} meters")
-            link_ok = False
-            break
-        
-        previous_position = relay_drone.pos
+    if distance> 1000:
+        print("step #",step)
+        deploy_relay(relay_drones)
+        positions.append(relay_drones[-1].pos)  # Add new position for the relay drone
+        #print("all positions", positions)
+        #coms_metrics = calculate_coms_metrics(positions)
+        end_to_end_sinr_DB = calculate_sinr_with_fading(positions)
+        print(end_to_end_sinr_DB)
 
-    # Final hop to the video drone
-    last_relay_position = operator.pos if not relay_drones else relay_drones[-1].pos
-    last_relay_distance = coms.calculate_distance(video_drone.pos, last_relay_position)
-    received_power_last = coms.calculate_received_power(last_relay_distance)
 
-    if step % 100 == 0:
-        print(f"# of relays: {len(relay_drones)}, Signal strength: {received_power_last:.2f}, Video drone position: {video_drone.pos}")
+
+
