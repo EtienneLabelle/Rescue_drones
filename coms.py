@@ -9,52 +9,41 @@ TRANSMIT_POWER = 30  # Transmit power in dBm (decibel milliwatts)
 MIN_RECEIVE_POWER = -80  # Minimum power in dBm for a stable link
 BOLTZMANN_CONSTANT = 1.38e-23  # Boltzmann's constant in Joules/Kelvin
 TEMPERATURE = 290  # Room temperature in Kelvin
-# Speed of light
 C = 3e8  # meters/second
-# Wavelength of the signal (lambda = c / f)
 WAVELENGHT = C / FREQUENCY
-# Constants
 
 
-class Coms_Metrics:
+class Link:
+    def __init__(self, drone1, drone2, bandwidth, frequency, noise_power_dBm):
+        self.drone1 = drone1
+        self.drone2 = drone2
+        self.distance = self.calculate_distance()
+        self.bandwidth = bandwidth
+        self.frequency = frequency
+        self.noise_power_dBm = noise_power_dBm
+        self.sinr_dB = None
+        self.capacity_bps = None
 
-    def __init__(self):
-        self.end_to_end_PL = None  # Path Loss
-        self.link_SNRs = []  # List to store SNR values for each drone-to-drone link
-        self.drones_RP = []  # Received Power between drones
-        self.data_rate_Mbps = None  # Data rate in Mbps (Shannon Capacity)
-        self.latency = None  # Total end-to-end delay
-        self.packet_loss_rate = None  # Packet loss rate
-        self.throughput_Mbps = None  # Actual data rate (throughput)
+    def calculate_distance(self):
+        return math.sqrt((self.drone1.pos[0] - self.drone2.pos[0])**2 + 
+                         (self.drone1.pos[1] - self.drone2.pos[1])**2)
 
+    def calculate_fspl(self):
+        fspl = 20 * math.log10(self.distance) + 20 * math.log10(self.frequency) - 147.55
+        return fspl
 
-""" kept this cause nice implementation but nothing in it work for now
-    def update_end_to_end_PL(self, positions):
-        # Update end-to-end path loss based on positions
-        self.end_to_end_PL = calculate_end_to_end_path_loss(positions)
-
-    def update_drones_SNR(self, positions):
-        # Update SNR based on positions
-        self.drones_SNR = calculate_snr_linear(positions)
-
-    def update_drones_RP(self, positions):
-        # Update received power based on positions
-        self.drones_RP = calculate_received_power(positions)
-"""
-
-# Function collecting all metrics with the intention of displaying and debugging
-def calculate_coms_metrics(positions):
-    # Instantiate the metrics object
-    coms_metrics = Coms_Metrics()
+    def calculate_sinr(self):
+        fspl = self.calculate_fspl()
+        received_power_dBm = TRANSMIT_POWER - fspl
+        self.sinr_dB = received_power_dBm - self.noise_power_dBm
+        return self.sinr_dB
     
-    # Update the metrics by calling the appropriate methods
-    #coms_metrics.update_end_to_end_PL(positions)  ### not very useful for the system can be a good debbuging tool
-    #coms_metrics.update_drones_SNR(positions)
-    #coms_metrics.update_drones_RP(positions)
-    
-    # Return or display the collected metrics
-    return coms_metrics
-
+    def calculate_capacity(self):
+        if self.sinr_dB is None:
+            self.calculate_sinr()
+        sinr_linear = 10 ** (self.sinr_dB / 10)
+        self.capacity_bps = self.bandwidth * math.log2(1 + sinr_linear)
+        return self.capacity_bps
 
 def calculate_received_power(distance):
     """
@@ -101,8 +90,6 @@ def calculate_interference_power(interference_sources):
     
     return total_interference_power_dBm
 
-
-#You can apply these fading models to the received power as a multiplicative factor.
 def rayleigh_fading():
     """
     Simulate Rayleigh fading (NLoS).
@@ -174,11 +161,9 @@ def calculate_sinr_with_fading(positions,fading_type='rician', interference_sour
     
     return end_to_end_snr_dB
 
-
 def calculate_shannon_capacity(bandwidth, linear_snr):
     # Shannon capacity formula
     return bandwidth * math.log2(1 + linear_snr)
-
 
 def calculate_end_to_end_path_loss(positions):
     """

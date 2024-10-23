@@ -1,63 +1,41 @@
 # env/grid.py
 import random
 import numpy as np
-import coms
-
-class GridEnvironment:
-    def __init__(self, width=10, height=10, num_interference_sources=5):
-        """
-        Initialize the grid environment.
-
-        :param width: Width of the grid
-        :param height: Height of the grid
-        :param num_obstacles: Number of obstacles on the grid
-        """
-        self.width = width
-        self.height = height
-        # Create the grid: 0 = empty, 2 = obstacle, 3 = goal
-        self.grid = np.zeros((height, width), dtype=int)
-        self.interference_sources = self.create_interference_sources(num_interference_sources)
-
-    def create_interference_sources(self, num_sources):
-        """
-        Randomly place interference sources on the grid.
-        :param num_sources: Number of interference sources to generate.
-        :return: List of interference source positions.
-        """
-        interference_sources = []
-        for _ in range(num_sources):
-            while True:
-                x, y = random.randint(0, self.width - 1), random.randint(0, self.height - 1)
-                if self.grid[y, x] == 0:  # Make sure the spot is empty
-                    self.grid[y, x] = 99  # Mark the grid with a value for interference (e.g., 3)
-                    interference_sources.append((x, y))
-                    break
-        return interference_sources
-
-
-    def render(self):
-        """Prints the grid to the console."""
-        render_grid = self.grid.copy()
-        print(render_grid)
-
+from coms import Link
+from drones import Drone
         
-""" This could be good not sure yet
+
 class Simulation:
-    def __init__(self):
-        self.drones = []  # List of all drone objects
-        self.positions = []  # List of all drone positions (updated regularly)
+    def __init__(self, bandwidth, frequency, noise_power_dBm):
+        self.drones = []  # List of drones in the simulation : index 0 is video drone last is operator
+        self.links = []   # List of links between drones
+        self.bandwidth = bandwidth
+        self.frequency = frequency
+        self.noise_power_dBm = noise_power_dBm
+    
+    def get_all_positions(self):
+        """
+        Return a list of all drone positions.
+        """
+        return [drone.pos for drone in self.drones]    
 
-    def add_drone(self, drone):
-        self.drones.append(drone)
-        self.positions.append(drone.get_position())  # Initialize with starting position
+    def create_links(self):
+        self.links = []
+        for i in range(len(self.drones) - 1):
+            link = Link(self.drones[i], self.drones[i + 1], self.bandwidth, self.frequency, self.noise_power_dBm)
+            self.links.append(link)
 
-    def update_positions(self):
-        # Update the positions list based on drone movements
-        self.positions = [drone.get_position() for drone in self.drones]
+    def run_simulation(self):
+        # Compute SINR and capacity for each link
+        for link in self.links:
+            sinr = link.calculate_sinr()
+            capacity = link.calculate_capacity()
+            print(f"Link from Drone {self.drones.index(link.drone1)} to Drone {self.drones.index(link.drone2)}")
+            print(f"  SINR: {sinr:.2f} dB, Capacity: {capacity:.2f} bps")
+    
+    def deploy_relay(self):
+        new_relay = Drone(position=[10,10]) 
+        self.drones.insert(-1, new_relay)
+        self.create_links()
 
-    def simulate_step(self):
-        # Move each drone (this is just an example, you'd have specific logic)
-        for drone in self.drones:
-            drone.move((1, 1))  # Example movement
-        self.update_positions()  # Update the position list after moving
-"""
+

@@ -1,44 +1,37 @@
 from coms import calculate_sinr_with_fading
-from drones import Drone, Operator, deploy_relay
+from drones import Operator, Drone
 from utils import calculate_distance
+from env import Simulation
 
 FREQUENCY = 2.4e9  # 2.4 GHz
 BANDWIDTH = 20e6   # 20 MHz
 TRANSMIT_POWER = 30  # Transmit power in dBm (decibel milliwatts)
 MIN_RECEIVE_POWER = -80  # Minimum power in dBm for a stable link
+NOISE_POWER = -90
 
-# Setup initial positions in 2D
-operator = Operator([0, 0])  # Operator starts at position (0, 0)
-video_drone = Drone([0, 0])  # Video drone starts at the same position
-# List to store relay drones
-relay_drones = []
-positions = []
+sim = Simulation(BANDWIDTH,FREQUENCY,NOISE_POWER)
 
+operator = Drone([0, 0])  # Operator starts at position (0, 0)
+
+sim.drones.append(operator)
+
+sim.deploy_relay() # this is video drone
 
 # Simulation loop
 for step in range(1, 2000):  
 
-    video_drone.move([10, 10])  
-    if len(positions) == 0:  # If the list is empty
-        positions.append(video_drone.pos)  # Initialize the list with the first position
-    else:
-        positions[0] = video_drone.pos  # Replace the first position if it exists
-
-    for i, drone in enumerate(relay_drones):
+    for i, drone in enumerate(sim.drones[:-1]):
         drone.move([10,10])
-        positions[i+1] = drone.pos  # Update existing position
-
-    last_point = video_drone.pos if not relay_drones else relay_drones[-1].pos
-    distance = calculate_distance(operator.pos,last_point)
+        
+    distance = calculate_distance(sim.drones[-1].pos,sim.drones[0].pos if len(sim.drones) == 2 else sim.drones[-2].pos)
 
     if distance> 1000:
         print("step #",step)
-        deploy_relay(relay_drones)
-        positions.append(relay_drones[-1].pos)  # Add new position for the relay drone
+        sim.deploy_relay()
+        #positions = sim.get_all_positions()
         #print("all positions", positions)
-        #coms_metrics = calculate_coms_metrics(positions)
-        end_to_end_sinr_DB = calculate_sinr_with_fading(positions)
-        print(end_to_end_sinr_DB)
+        sim.run_simulation()
+
 
 
 
