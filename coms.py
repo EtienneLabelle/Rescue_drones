@@ -23,10 +23,18 @@ class Link:
         self.noise_power_dBm = noise_power_dBm
         self.sinr_dB = None
         self.capacity_bps = None
+        self.isBlocked = False
 
+    def __str__(self):
+        # This string will be returned whenever print(link) is called
+        return (f"Link from Drone {self.drone1.id}, {self.drone1.pos}, to Drone {self.drone2.id}, {self.drone2.pos}\n"
+                f"  SINR: {self.sinr_dB:.2f} dB, Capacity: {self.capacity_bps:.2f} bps\n"
+                f"  Distance: {self.distance:.2f} meters, Blocked?: {self.isBlocked}")
+    
     def calculate_distance(self):
-        return math.sqrt((self.drone1.pos[0] - self.drone2.pos[0])**2 + 
+        distance = math.sqrt((self.drone1.pos[0] - self.drone2.pos[0])**2 + 
                          (self.drone1.pos[1] - self.drone2.pos[1])**2)
+        return distance
 
     def calculate_fspl(self):
         fspl = 20 * math.log10(self.distance) + 20 * math.log10(self.frequency) - 147.55
@@ -44,6 +52,37 @@ class Link:
         sinr_linear = 10 ** (self.sinr_dB / 10)
         self.capacity_bps = self.bandwidth * math.log2(1 + sinr_linear)
         return self.capacity_bps
+
+    def obstacle_detection(self, obstacles):
+        """
+        Check if there is an obstacle between drone1 and drone2.
+        Sets self.isBlocked to True if an obstacle blocks the path, otherwise False.
+        """
+        # Coordinates of drone1 and drone2
+        x1, y1 = self.drone1.pos
+        x2, y2 = self.drone2.pos
+
+        # Loop through each obstacle in the environment
+        for obstacle in obstacles:
+            obstacle_x = obstacle.center_pos[0]
+            obstacle_y_range = [edge[1] for edge in obstacle.edges_pos]  # Y-range of the obstacle
+
+            # Check if the obstacle's x-coordinate is between drone1 and drone2
+            if min(x1, x2) <= obstacle_x <= max(x1, x2):
+                # Calculate expected y at obstacle's x-position based on line from (x1, y1) to (x2, y2)
+                if x1 != x2:  # Avoid division by zero for vertical lines
+                    slope = (y2 - y1) / (x2 - x1)
+                    intercept = y1 - slope * x1
+                    obstacle_y_at_x = slope * obstacle_x + intercept
+
+                    # Check if the y-coordinate of the obstacle is close to the calculated line y
+                    if min(obstacle_y_range) <= obstacle_y_at_x <= max(obstacle_y_range):
+                        self.isBlocked = True
+                        break
+                else:  # Vertical line case
+                    if min(y1, y2) <= obstacle.center_pos[1] <= max(y1, y2):
+                        self.isBlocked = True
+                        break
 
 def calculate_received_power(distance):
     """

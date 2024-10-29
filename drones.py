@@ -1,5 +1,6 @@
 class Drone:
-    def __init__(self, position, battery_level=100):
+    def __init__(self, id, position, battery_level=100):
+        self.id = id
         self.pos = position
         self.battery_level = battery_level
 
