@@ -1,8 +1,5 @@
 # env/grid.py       
-import matplotlib.pyplot as plt
-from matplotlib.animation import FuncAnimation
 import random
-import numpy as np
 from coms import Link
 from drones import Drone
         
@@ -36,7 +33,7 @@ class Simulation:
             link.calculate_sinr()
             link.calculate_capacity()
             link.obstacle_detection(self.obstacles)
-            print(link)
+            #print(link)
    
     def deploy_relay(self,id):
         new_relay = Drone(id,position=[10,10]) 
@@ -48,8 +45,8 @@ class Simulation:
         self.obstacles = []  
         
         for i in range(number_of_obstacles):
-            center_x = random.randint(5, 15000) # will need to change this at some point
-            center_y = random.randint(5, 15000)        
+            center_x = random.randint(5, 19000) # will need to change this at some point
+            center_y = random.randint(5, 19000)        
             obstacle = Obstacle(center_position=(center_x, center_y))
             obstacle.calculate_edges(size)
             self.obstacles.append(obstacle)

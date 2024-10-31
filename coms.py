@@ -84,6 +84,8 @@ class Link:
                         self.isBlocked = True
                         break
 
+            self.isBlocked = False
+
 def calculate_received_power(distance):
     """
     Calculate the received power in dBm using the Friis transmission equation in dBm directly.
