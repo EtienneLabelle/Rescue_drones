@@ -12,8 +12,7 @@ class Simulation:
         self.bandwidth = bandwidth
         self.frequency = frequency
         self.noise_power_dBm = noise_power_dBm
-
-    
+ 
     def get_all_positions(self):
         """
         Return a list of all drone positions.
