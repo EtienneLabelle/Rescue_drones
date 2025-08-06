@@ -4,3 +4,5 @@ venv/
 .env
 log/
 *.log
+.cursor/
+runs/
