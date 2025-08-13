@@ -37,6 +37,14 @@ class DQNNetwork(nn.Module):
         self.fc2 = nn.Linear(128, 128)
         self.fc3 = nn.Linear(128, action_dim)
         
+        # Initialize weights properly
+        torch.nn.init.xavier_uniform_(self.fc1.weight)
+        torch.nn.init.zeros_(self.fc1.bias)
+        torch.nn.init.xavier_uniform_(self.fc2.weight)
+        torch.nn.init.zeros_(self.fc2.bias)
+        torch.nn.init.xavier_uniform_(self.fc3.weight)
+        torch.nn.init.zeros_(self.fc3.bias)
+        
     def forward(self, x):
         x = torch.relu(self.fc1(x))
         x = torch.relu(self.fc2(x))
@@ -52,8 +60,11 @@ class DQNAgent(BaseRLAgent):
         self.epsilon_decay = epsilon_decay
         self.memory = deque(maxlen=memory_size)
         
-        self.q_network = DQNNetwork(state_dim, action_dim)
-        self.target_network = DQNNetwork(state_dim, action_dim)
+        # Device handling
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        self.q_network = DQNNetwork(state_dim, action_dim).to(self.device)
+        self.target_network = DQNNetwork(state_dim, action_dim).to(self.device)
         self.optimizer = optim.Adam(self.q_network.parameters(), lr=learning_rate)
         self.update_target_network()
     
@@ -67,7 +78,7 @@ class DQNAgent(BaseRLAgent):
         if np.random.random() <= self.epsilon:
             return random.randrange(self.action_dim)
         
-        state = torch.FloatTensor(state).unsqueeze(0)
+        state = torch.FloatTensor(state).unsqueeze(0).to(self.device)
         q_values = self.q_network(state)
         return q_values.argmax().item()
     
@@ -76,11 +87,11 @@ class DQNAgent(BaseRLAgent):
             return
         
         batch = random.sample(self.memory, batch_size)
-        states = torch.FloatTensor([e[0] for e in batch])
-        actions = torch.LongTensor([e[1] for e in batch])
-        rewards = torch.FloatTensor([e[2] for e in batch])
-        next_states = torch.FloatTensor([e[3] for e in batch])
-        dones = torch.BoolTensor([e[4] for e in batch])
+        states = torch.FloatTensor([e[0] for e in batch]).to(self.device)
+        actions = torch.LongTensor([e[1] for e in batch]).to(self.device)
+        rewards = torch.FloatTensor([e[2] for e in batch]).to(self.device)
+        next_states = torch.FloatTensor([e[3] for e in batch]).to(self.device)
+        dones = torch.BoolTensor([e[4] for e in batch]).to(self.device)
         
         current_q_values = self.q_network(states).gather(1, actions.unsqueeze(1))
         next_q_values = self.target_network(next_states).max(1)[0].detach()
@@ -111,11 +122,19 @@ class DQNAgent(BaseRLAgent):
         self.epsilon = checkpoint['epsilon']
 
 class PPOActor(nn.Module):
-    def __init__(self, state_dim, action_dim):
+    def __init__(self, state_dim, action_dim, hidden_dim=128):
         super().__init__()
-        self.fc1 = nn.Linear(state_dim, 128)
-        self.fc2 = nn.Linear(128, 128)
-        self.fc3 = nn.Linear(128, action_dim)
+        self.fc1 = nn.Linear(state_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.fc3 = nn.Linear(hidden_dim, action_dim)
+        
+        # Initialize weights properly
+        torch.nn.init.xavier_uniform_(self.fc1.weight)
+        torch.nn.init.zeros_(self.fc1.bias)
+        torch.nn.init.xavier_uniform_(self.fc2.weight)
+        torch.nn.init.zeros_(self.fc2.bias)
+        torch.nn.init.xavier_uniform_(self.fc3.weight)
+        torch.nn.init.zeros_(self.fc3.bias)
         
     def forward(self, x):
         x = torch.relu(self.fc1(x))
@@ -123,11 +142,19 @@ class PPOActor(nn.Module):
         return torch.softmax(self.fc3(x), dim=-1)
 
 class PPOCritic(nn.Module):
-    def __init__(self, state_dim):
+    def __init__(self, state_dim, hidden_dim=128):
         super().__init__()
-        self.fc1 = nn.Linear(state_dim, 128)
-        self.fc2 = nn.Linear(128, 128)
-        self.fc3 = nn.Linear(128, 1)
+        self.fc1 = nn.Linear(state_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.fc3 = nn.Linear(hidden_dim, 1)
+        
+        # Initialize weights properly
+        torch.nn.init.xavier_uniform_(self.fc1.weight)
+        torch.nn.init.zeros_(self.fc1.bias)
+        torch.nn.init.xavier_uniform_(self.fc2.weight)
+        torch.nn.init.zeros_(self.fc2.bias)
+        torch.nn.init.xavier_uniform_(self.fc3.weight)
+        torch.nn.init.zeros_(self.fc3.bias)
         
     def forward(self, x):
         x = torch.relu(self.fc1(x))
@@ -143,14 +170,17 @@ class PPOAgent(BaseRLAgent):
         self.value_coef = value_coef
         self.entropy_coef = entropy_coef
         
-        self.actor = PPOActor(state_dim, action_dim)
-        self.critic = PPOCritic(state_dim)
+        # Device handling
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        self.actor = PPOActor(state_dim, action_dim).to(self.device)
+        self.critic = PPOCritic(state_dim).to(self.device)
         self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=learning_rate)
         self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=learning_rate)
         self.memory = []
     
     def select_action(self, state):
-        state = torch.FloatTensor(state).unsqueeze(0)
+        state = torch.FloatTensor(state).unsqueeze(0).to(self.device)
         action_probs = self.actor(state)
         action_dist = torch.distributions.Categorical(action_probs)
         action = action_dist.sample()
@@ -163,12 +193,12 @@ class PPOAgent(BaseRLAgent):
         if len(self.memory) == 0:
             return
         
-        states = torch.FloatTensor([e[0] for e in self.memory])
-        actions = torch.LongTensor([e[1] for e in self.memory])
-        rewards = torch.FloatTensor([e[2] for e in self.memory])
-        next_states = torch.FloatTensor([e[3] for e in self.memory])
-        dones = torch.BoolTensor([e[4] for e in self.memory])
-        old_log_probs = torch.FloatTensor([e[5] for e in self.memory])
+        states = torch.FloatTensor([e[0] for e in self.memory]).to(self.device)
+        actions = torch.LongTensor([e[1] for e in self.memory]).to(self.device)
+        rewards = torch.FloatTensor([e[2] for e in self.memory]).to(self.device)
+        next_states = torch.FloatTensor([e[3] for e in self.memory]).to(self.device)
+        dones = torch.BoolTensor([e[4] for e in self.memory]).to(self.device)
+        old_log_probs = torch.FloatTensor([e[5] for e in self.memory]).to(self.device)
         
         # Calculate returns
         returns = []
@@ -179,7 +209,7 @@ class PPOAgent(BaseRLAgent):
             discounted_reward = reward + self.gamma * discounted_reward
             returns.insert(0, discounted_reward)
         
-        returns = torch.FloatTensor(returns)
+        returns = torch.FloatTensor(returns).to(self.device)
         returns = (returns - returns.mean()) / (returns.std() + 1e-8)
         
         # Calculate values and advantages
@@ -225,18 +255,62 @@ class PPOAgent(BaseRLAgent):
         self.actor_optimizer.load_state_dict(checkpoint['actor_optimizer_state_dict'])
         self.critic_optimizer.load_state_dict(checkpoint['critic_optimizer_state_dict'])
 
+class A2CActor(nn.Module):
+    def __init__(self, state_dim, action_dim, hidden_dim=128):
+        super().__init__()
+        self.fc1 = nn.Linear(state_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.fc3 = nn.Linear(hidden_dim, action_dim)
+        
+        # Initialize weights properly
+        torch.nn.init.xavier_uniform_(self.fc1.weight)
+        torch.nn.init.zeros_(self.fc1.bias)
+        torch.nn.init.xavier_uniform_(self.fc2.weight)
+        torch.nn.init.zeros_(self.fc2.bias)
+        torch.nn.init.xavier_uniform_(self.fc3.weight)
+        torch.nn.init.zeros_(self.fc3.bias)
+        
+    def forward(self, x):
+        x = torch.relu(self.fc1(x))
+        x = torch.relu(self.fc2(x))
+        return torch.softmax(self.fc3(x), dim=-1)
+
+class A2CCritic(nn.Module):
+    def __init__(self, state_dim, hidden_dim=128):
+        super().__init__()
+        self.fc1 = nn.Linear(state_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.fc3 = nn.Linear(hidden_dim, 1)
+        
+        # Initialize weights properly
+        torch.nn.init.xavier_uniform_(self.fc1.weight)
+        torch.nn.init.zeros_(self.fc1.bias)
+        torch.nn.init.xavier_uniform_(self.fc2.weight)
+        torch.nn.init.zeros_(self.fc2.bias)
+        torch.nn.init.xavier_uniform_(self.fc3.weight)
+        torch.nn.init.zeros_(self.fc3.bias)
+        
+    def forward(self, x):
+        x = torch.relu(self.fc1(x))
+        x = torch.relu(self.fc2(x))
+        return self.fc3(x)
+
 class A2CAgent(BaseRLAgent):
     def __init__(self, state_dim, action_dim, learning_rate=0.001, gamma=0.99):
         super().__init__(state_dim, action_dim, learning_rate)
         self.gamma = gamma
-        self.actor = PPOActor(state_dim, action_dim)
-        self.critic = PPOCritic(state_dim)
+        
+        # Device handling
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        self.actor = A2CActor(state_dim, action_dim).to(self.device)
+        self.critic = A2CCritic(state_dim).to(self.device)
         self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=learning_rate)
         self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=learning_rate)
         self.memory = []
     
     def select_action(self, state):
-        state = torch.FloatTensor(state).unsqueeze(0)
+        state = torch.FloatTensor(state).unsqueeze(0).to(self.device)
         action_probs = self.actor(state)
         action_dist = torch.distributions.Categorical(action_probs)
         action = action_dist.sample()
@@ -249,12 +323,12 @@ class A2CAgent(BaseRLAgent):
         if len(self.memory) == 0:
             return
         
-        states = torch.FloatTensor([e[0] for e in self.memory])
-        actions = torch.LongTensor([e[1] for e in self.memory])
-        rewards = torch.FloatTensor([e[2] for e in self.memory])
-        next_states = torch.FloatTensor([e[3] for e in self.memory])
-        dones = torch.BoolTensor([e[4] for e in self.memory])
-        log_probs = torch.FloatTensor([e[5] for e in self.memory])
+        states = torch.FloatTensor([e[0] for e in self.memory]).to(self.device)
+        actions = torch.LongTensor([e[1] for e in self.memory]).to(self.device)
+        rewards = torch.FloatTensor([e[2] for e in self.memory]).to(self.device)
+        next_states = torch.FloatTensor([e[3] for e in self.memory]).to(self.device)
+        dones = torch.BoolTensor([e[4] for e in self.memory]).to(self.device)
+        log_probs = torch.FloatTensor([e[5] for e in self.memory]).to(self.device)
         
         # Calculate returns and advantages
         values = self.critic(states).squeeze()
@@ -267,7 +341,7 @@ class A2CAgent(BaseRLAgent):
             else:
                 returns.append(reward + self.gamma * next_value)
         
-        returns = torch.FloatTensor(returns)
+        returns = torch.FloatTensor(returns).to(self.device)
         advantages = returns - values.detach()
         
         # Actor loss
@@ -329,6 +403,14 @@ class MADDPGCritic(nn.Module):
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
         self.fc3 = nn.Linear(hidden_dim, 1)
         
+        # Initialize weights properly
+        torch.nn.init.xavier_uniform_(self.fc1.weight)
+        torch.nn.init.zeros_(self.fc1.bias)
+        torch.nn.init.xavier_uniform_(self.fc2.weight)
+        torch.nn.init.zeros_(self.fc2.bias)
+        torch.nn.init.xavier_uniform_(self.fc3.weight)
+        torch.nn.init.zeros_(self.fc3.bias)
+        
     def forward(self, states, actions):
         x = torch.cat([states, actions], dim=1)
         x = torch.relu(self.fc1(x))
@@ -379,14 +461,24 @@ class MADDPGAgent(BaseRLAgent):
         self.gamma = gamma
         self.tau = tau
         
+        # Device handling
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
         # Shared centralized replay buffer
         self.shared_buffer = shared_buffer
         
         # Networks
-        self.actor = MADDPGActor(state_dim, action_dim)
-        self.critic = MADDPGCritic(self.total_state_dim, self.total_action_dim)
-        self.target_actor = MADDPGActor(state_dim, action_dim)
-        self.target_critic = MADDPGCritic(self.total_state_dim, self.total_action_dim)
+        self.actor = MADDPGActor(state_dim, action_dim).to(self.device)
+        self.critic = MADDPGCritic(self.total_state_dim, self.total_action_dim).to(self.device)
+        
+        # CRITICAL FIX: Independent target networks for each agent
+        self.target_actors = {}
+        self.target_critics = {}
+        
+        for i in range(num_agents):
+            agent_name = f"agent_{i}"
+            self.target_actors[agent_name] = MADDPGActor(state_dim, action_dim).to(self.device)
+            self.target_critics[agent_name] = MADDPGCritic(self.total_state_dim, self.total_action_dim).to(self.device)
         
         # Optimizers
         self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=learning_rate)
@@ -398,11 +490,12 @@ class MADDPGAgent(BaseRLAgent):
     def update_target_networks(self, tau=None):
         if tau is None:
             tau = self.tau
-            
-        for target_param, param in zip(self.target_actor.parameters(), self.actor.parameters()):
+        
+        # Update this agent's main target networks
+        for target_param, param in zip(self.target_actors[f"agent_{int(self.agent_id.split('_')[1])-1}"].parameters(), self.actor.parameters()):
             target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
             
-        for target_param, param in zip(self.target_critic.parameters(), self.critic.parameters()):
+        for target_param, param in zip(self.target_critics[f"agent_{int(self.agent_id.split('_')[1])-1}"].parameters(), self.critic.parameters()):
             target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
     
     def remember(self, joint_state, joint_action, joint_reward, joint_next_state, joint_done):
@@ -411,8 +504,8 @@ class MADDPGAgent(BaseRLAgent):
             self.shared_buffer.push(joint_state, joint_action, joint_reward, joint_next_state, joint_done)
     
     def select_action(self, state, noise_scale=0.1):
-        state = torch.FloatTensor(state).unsqueeze(0)
-        action = self.actor(state).squeeze(0).detach().numpy()
+        state = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+        action = self.actor(state).squeeze(0).detach().cpu().numpy()
         
         # Add noise for exploration
         noise = np.random.normal(0, noise_scale, action.shape)
@@ -431,6 +524,13 @@ class MADDPGAgent(BaseRLAgent):
             return None if return_losses else None
         
         joint_states, joint_actions, joint_rewards, joint_next_states, joint_dones = batch
+        
+        # Move batch to device
+        joint_states = joint_states.to(self.device)
+        joint_actions = joint_actions.to(self.device)
+        joint_rewards = joint_rewards.to(self.device)
+        joint_next_states = joint_next_states.to(self.device)
+        joint_dones = joint_dones.to(self.device)
         
         # Extract this agent's data from joint tensors
         # agent_id format is "uav_1", "uav_2", etc. (1-indexed)
@@ -456,17 +556,23 @@ class MADDPGAgent(BaseRLAgent):
         current_q_values = self.critic(joint_states, joint_actions)
         
         with torch.no_grad():
-            # Compute next actions for all agents
+            # CRITICAL FIX: Use INDEPENDENT target actors for each agent
             next_actions = []
             for i in range(self.num_agents):
                 start_idx = i * state_dim
                 end_idx = start_idx + state_dim
                 agent_next_states = joint_next_states[:, start_idx:end_idx]
-                next_actions.append(self.target_actor(agent_next_states))
+                
+                # Use THIS agent's target actor for agent i
+                target_actor = self.target_actors[f"agent_{i}"]
+                next_actions.append(target_actor(agent_next_states))
             
             # Concatenate all next actions in consistent order
             next_joint_actions = torch.cat(next_actions, dim=1)
-            next_q_values = self.target_critic(joint_next_states, next_joint_actions)
+            
+            # Use THIS agent's target critic
+            target_critic = self.target_critics[f"agent_{agent_idx}"]
+            next_q_values = target_critic(joint_next_states, next_joint_actions)
             
             # Compute target Q-values
             target_q_values = rewards + (self.gamma * next_q_values * (~dones).float())
@@ -503,11 +609,15 @@ class MADDPGAgent(BaseRLAgent):
         return None
     
     def save_model(self, path):
+        # Save all target networks
+        target_actors_state = {name: net.state_dict() for name, net in self.target_actors.items()}
+        target_critics_state = {name: net.state_dict() for name, net in self.target_critics.items()}
+        
         torch.save({
             'actor_state_dict': self.actor.state_dict(),
             'critic_state_dict': self.critic.state_dict(),
-            'target_actor_state_dict': self.target_actor.state_dict(),
-            'target_critic_state_dict': self.target_critic.state_dict(),
+            'target_actors_state_dict': target_actors_state,
+            'target_critics_state_dict': target_critics_state,
             'actor_optimizer_state_dict': self.actor_optimizer.state_dict(),
             'critic_optimizer_state_dict': self.critic_optimizer.state_dict(),
             'agent_id': self.agent_id
@@ -517,16 +627,32 @@ class MADDPGAgent(BaseRLAgent):
         checkpoint = torch.load(path)
         self.actor.load_state_dict(checkpoint['actor_state_dict'])
         self.critic.load_state_dict(checkpoint['critic_state_dict'])
-        self.target_actor.load_state_dict(checkpoint['target_actor_state_dict'])
-        self.target_critic.load_state_dict(checkpoint['target_critic_state_dict'])
+        
+        # Load all target networks
+        target_actors_state = checkpoint['target_actors_state_dict']
+        target_critics_state = checkpoint['target_critics_state_dict']
+        
+        for name, state_dict in target_actors_state.items():
+            if name in self.target_actors:
+                self.target_actors[name].load_state_dict(state_dict)
+        
+        for name, state_dict in target_critics_state.items():
+            if name in self.target_critics:
+                self.target_critics[name].load_state_dict(state_dict)
+        
         self.actor_optimizer.load_state_dict(checkpoint['actor_optimizer_state_dict'])
         self.critic_optimizer.load_state_dict(checkpoint['critic_optimizer_state_dict'])
         self.agent_id = checkpoint['agent_id']
 
     def reset_critic(self):
         """Reset critic network to fix backwards learning"""
-        self.critic = MADDPGCritic(self.total_state_dim, self.total_action_dim).to(self.device)
-        self.target_critic = MADDPGCritic(self.total_state_dim, self.total_action_dim).to(self.device)
+        self.critic = MADDPGCritic(self.total_state_dim, self.total_action_dim)
+        
+        # Reset all target critics for this agent
+        for i in range(self.num_agents):
+            agent_name = f"agent_{i}"
+            self.target_critics[agent_name] = MADDPGCritic(self.total_state_dim, self.total_action_dim)
+        
         self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=self.learning_rate)
         self.update_target_networks(tau=1.0)  # Copy weights immediately
 

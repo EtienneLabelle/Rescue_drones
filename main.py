@@ -2,25 +2,23 @@ from env import DisasterCoverageEnvironment
 from display import SimpleAnimator
 import tkinter as tk
 import numpy as np
-from experiment_framework import ExperimentConfig
 from RL import MADDPGAgent, CentralizedReplayBuffer
 from config import Config
 import torch
 from torch.utils.tensorboard import SummaryWriter
 import os
 from datetime import datetime
+import random
+
+# Evaluation seed for reproducible final testing
+EVAL_SEED = 42
 
 # Create TensorBoard writer
 log_dir = f"runs/drone_simulation_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 writer = SummaryWriter(log_dir)
 
-# Configuration
-config = ExperimentConfig(
-    num_uavs=Config.NUM_UAVS, 
-    num_episodes=10, 
-    episode_length=Config.EPISODE_LENGTH
-)
-env = DisasterCoverageEnvironment(config)
+# Configuration - using Config class directly since it's static
+env = DisasterCoverageEnvironment(Config)
 
 # Create shared centralized replay buffer
 shared_buffer = CentralizedReplayBuffer(max_size=Config.BUFFER_SIZE)
@@ -31,8 +29,8 @@ for i in range(Config.NUM_UAVS):
     agent_id = f"uav_{i+1}"
     agent = MADDPGAgent(
         agent_id=agent_id,
-        state_dim=config.state_dim,
-        action_dim=config.action_dim,
+        state_dim=Config.STATE_DIM,
+        action_dim=Config.ACTION_DIM,
         num_agents=Config.NUM_UAVS,
         learning_rate=Config.LEARNING_RATE,
         shared_buffer=shared_buffer
@@ -67,7 +65,7 @@ for episode in range(Config.TRAINING_EPISODES):
     # Decay exploration noise
     noise_scale = max(Config.FINAL_NOISE, Config.INITIAL_NOISE - episode * Config.NOISE_DECAY)
     
-    for step in range(config.episode_length):
+    for step in range(Config.EPISODE_LENGTH):
         # Get actions from agents
         actions = {}
         for agent_id, agent in agents.items():
@@ -95,7 +93,7 @@ for episode in range(Config.TRAINING_EPISODES):
         joint_next_state = []
         joint_done = []
         
-        for i in range(config.num_uavs):
+        for i in range(Config.NUM_UAVS):
             agent_id = f"uav_{i+1}"
             if agent_id in states and agent_id in new_states:
                 joint_state.extend(states[agent_id])
@@ -105,10 +103,10 @@ for episode in range(Config.TRAINING_EPISODES):
                 joint_done.append(done)
             else:
                 # Fill with zeros if agent not present
-                joint_state.extend([0] * config.state_dim)
-                joint_action.extend([0] * config.action_dim)
+                joint_state.extend([0] * Config.STATE_DIM)
+                joint_action.extend([0] * Config.ACTION_DIM)
                 joint_reward.append(0)
-                joint_next_state.extend([0] * config.state_dim)
+                joint_next_state.extend([0] * Config.STATE_DIM)
                 joint_done.append(done)
         
         # Store joint experience
@@ -173,19 +171,36 @@ writer.add_scalar('Training/Final_Average_Coverage', np.mean(episode_coverage_hi
 
 print("Training complete! Running final simulation...")
 
-# Run final simulation with trained agents
-print("Running final simulation...")
-states = env.reset()
+# Run final simulation with trained agents (HONEST EVALUATION - NO NOISE)
+print("Running final simulation (HONEST EVALUATION - NO NOISE)...")
+print("Using fixed seed for reproducible results...")
+
+# Ensure deterministic behavior for evaluation
+np.random.seed(EVAL_SEED)
+random.seed(EVAL_SEED)
+torch.manual_seed(EVAL_SEED)
+torch.cuda.manual_seed_all(EVAL_SEED)
+
+# Generate fixed spawn positions for final simulation
+num_uavs = Config.NUM_UAVS
+fixed_positions = []
+for i in range(num_uavs):
+    np.random.seed(EVAL_SEED + i)  # Different seed for each UAV
+    x = np.random.uniform(1000, 19000)
+    y = np.random.uniform(1000, 19000)
+    fixed_positions.append([x, y])
+
+states = env.reset(deterministic=True, fixed_positions=fixed_positions)
 
 final_simulation_rewards = []
 final_simulation_coverage = []
 
-for step in range(config.episode_length):
-    # Get actions from trained agents
+for step in range(Config.EPISODE_LENGTH):
+    # Get actions from trained agents (ZERO NOISE for honest evaluation)
     actions = {}
     for agent_id, agent in agents.items():
         if agent_id in states:
-            action = agent.select_action(states[agent_id], noise_scale=0.01)
+            action = agent.select_action(states[agent_id], noise_scale=0.0)  # NO NOISE
             actions[agent_id] = action
     
     # Execute actions
@@ -229,7 +244,26 @@ if final_simulation_coverage:
 # Close TensorBoard writer
 writer.close()
 
-print("Simulation complete! Use buttons to control animation playback.")
+# HONEST EVALUATION: Run validation multiple times to ensure reproducibility
+print("\n" + "="*60)
+print("HONEST EVALUATION: Running validation tests...")
+print("="*60)
+
+# Run validation multiple times with same seed
+validation_results = []
+for i in range(3):
+    reward, coverage = env.run_validation_eval(agents, EVAL_SEED, f"Validation Run {i+1}")
+    validation_results.append((reward, coverage))
+
+# Check if results are identical (honest evaluation)
+if len(set(validation_results)) == 1:
+    print(f"\n✅ SUCCESS: All validation runs produced identical results!")
+    print(f"   This confirms deterministic behavior and honest evaluation.")
+else:
+    print(f"\n❌ WARNING: Validation runs produced different results!")
+    print(f"   This indicates non-deterministic behavior.")
+
+print("\nSimulation complete! Use buttons to control animation playback.")
 print(f"TensorBoard logs saved to: {log_dir}")
 print("To view logs, run: tensorboard --logdir=runs")
 root.mainloop()

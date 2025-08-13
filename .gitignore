@@ -6,3 +6,5 @@ log/
 *.log
 .cursor/
 runs/
+YO_YO_ELIMINATION_TODO.md
+.DS_Store

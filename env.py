@@ -4,7 +4,7 @@ import numpy as np
 from coms import Link
 from drones import Drone
 from config import Config
-        
+import torch
 
 class Simulation:
     def __init__(self,bandwidth,frequency,noise_power_dBm):
@@ -93,51 +93,40 @@ class DisasterCoverageEnvironment:
     
     def __init__(self, config):
         self.config = config
-        self.sim = Simulation(config.bandwidth, config.frequency, config.noise_power)
+        self.sim = Simulation(config.BANDWIDTH, config.FREQUENCY, config.NOISE_POWER)
         
-        # Create disaster zones
-        self.disaster_zones = self._create_disaster_zones()
+        # Create disaster zones (random for training)
+        self.disaster_zones = self._create_disaster_zones(deterministic=False)
         
-        # Initialize 3 UAVs
+        # Initialize UAVs
         self.uavs = []
         self._initialize_uavs()
         
         # Coverage tracking
         self.total_coverage = 0.0
         self.episode_steps = 0
-        self.max_steps = config.simulation_steps
+        self.max_steps = config.EPISODE_LENGTH
         
         # Communication links between UAVs
         self.sim.drones = self.uavs
         self.sim.create_links()
     
-    def _create_disaster_zones(self):
-        """Create disaster zones in the environment"""
-        zones = []
-        num_uavs = getattr(self.config, 'num_uavs', 3)
+    def _create_disaster_zones(self, deterministic=False, seed=None):
+        """Create disaster zones in the environment
         
-        if num_uavs == 5:
-            # Create 5 disaster zones with varying severity
-            zone_configs = [
-                ((5000, 5000), 1000, 0.9),   # High severity
-                ((15000, 5000), 800, 0.7),    # Medium severity
-                ((10000, 10000), 1200, 0.8),  # Medium-high severity
-                ((5000, 15000), 600, 0.6),    # Medium severity
-                ((15000, 15000), 900, 0.85)   # High severity
-            ]
-        elif num_uavs == 7:
-            # Create 7 disaster zones for 7 UAVs
-            zone_configs = [
-                ((3000, 3000), 800, 0.9),     # Zone 1
-                ((12000, 3000), 700, 0.8),    # Zone 2
-                ((20000, 3000), 600, 0.7),    # Zone 3
-                ((3000, 10000), 900, 0.85),   # Zone 4
-                ((12000, 10000), 1000, 0.9),  # Zone 5
-                ((3000, 17000), 700, 0.75),   # Zone 6
-                ((12000, 17000), 800, 0.8)    # Zone 7
-            ]
-        else:
-            # Generic zones for other numbers
+        Args:
+            deterministic: If True, use fixed zone positions for evaluation
+            seed: Seed for deterministic zone generation
+        """
+        zones = []
+        num_uavs = getattr(self.config, 'NUM_UAVS', 3)
+        
+        if deterministic and seed is not None:
+            # Deterministic zones for evaluation
+            np.random.seed(seed)
+            random.seed(seed)
+            
+            # Fixed grid-based approach for evaluation
             grid_size = int(np.ceil(np.sqrt(num_uavs)))
             spacing = 20000 // (grid_size + 1)
             
@@ -147,8 +136,17 @@ class DisasterCoverageEnvironment:
                 col = i % grid_size
                 x = spacing * (col + 1)
                 y = spacing * (row + 1)
-                radius = 800 + (i % 3) * 200  # Vary radius
-                severity = 0.6 + (i % 4) * 0.1  # Vary severity
+                radius = 800 + (i % 3) * 200
+                severity = 0.6 + (i % 4) * 0.1
+                zone_configs.append(((x, y), radius, severity))
+        else:
+            # Random zones for training
+            zone_configs = []
+            for i in range(num_uavs):
+                x = np.random.uniform(1000, 19000)
+                y = np.random.uniform(1000, 19000)
+                radius = np.random.uniform(600, 1200)
+                severity = np.random.uniform(0.5, 1.0)
                 zone_configs.append(((x, y), radius, severity))
         
         for center, radius, severity in zone_configs:
@@ -159,7 +157,7 @@ class DisasterCoverageEnvironment:
     
     def _initialize_uavs(self):
         """Initialize UAVs at random positions within bounds"""
-        num_uavs = getattr(self.config, 'num_uavs', 3)
+        num_uavs = getattr(self.config, 'NUM_UAVS', 3)
         
         # Generate random spawn positions
         start_positions = []
@@ -237,10 +235,10 @@ class DisasterCoverageEnvironment:
         state.append(min_capacity)
         
         # Pad state to fixed size
-        while len(state) < self.config.state_dim:
+        while len(state) < self.config.STATE_DIM:
             state.append(0.0)
         
-        return np.array(state[:self.config.state_dim])
+        return np.array(state[:self.config.STATE_DIM])
     
     def _get_minimum_link_capacity(self):
         """Get minimum link capacity in Mbps, representing the bottleneck link"""
@@ -356,7 +354,7 @@ class DisasterCoverageEnvironment:
         if nearest_zone:
             # 1. Strong reward for being IN a disaster zone
             if current_distance <= nearest_zone.radius:
-                reward += Config.ZONE_REWARD * nearest_zone.severity * 2.0  # Doubled zone reward
+                reward += self.config.ZONE_REWARD * nearest_zone.severity * 2.0  # Doubled zone reward
             else:
                 # 2. Progress-based reward for getting closer to the nearest zone (ONLY when NOT in zone)
                 if uav.prev_distance_to_zone is not None:
@@ -381,6 +379,110 @@ class DisasterCoverageEnvironment:
             x = np.random.uniform(1000, 19000)
             y = np.random.uniform(1000, 19000)
             start_positions.append([x, y])
+        
+        for i, uav in enumerate(self.uavs):
+            uav.pos = start_positions[i].copy()
+            uav.battery_level = 100.0
+            # Initialize prev_distance_to_zone for progress-based rewards
+            nearest_zone, current_distance = self._get_nearest_zone(uav.pos)
+            uav.prev_distance_to_zone = current_distance if nearest_zone else None
+        
+        # Recreate disaster zones for training (random)
+        self.disaster_zones = self._create_disaster_zones(deterministic=False)
+        
+        # Reset tracking variables
+        self.total_coverage = 0.0
+        self.episode_steps = 0
+        
+        # Recreate communication links
+        self.sim.drones = self.uavs
+        self.sim.create_links()
+        
+        # Return initial states
+        initial_states = {}
+        for uav in self.uavs:
+            initial_states[uav.id] = self.get_state(uav.id)
+        
+        return initial_states
+    
+    def get_coverage_metrics(self):
+        """Get current coverage metrics"""
+        metrics = {
+            'total_coverage': self.total_coverage,
+            'zone_coverage': [zone.coverage_status for zone in self.disaster_zones],
+            'uav_positions': [uav.pos for uav in self.uavs],
+            'battery_levels': [uav.battery_level for uav in self.uavs]
+        }
+        return metrics
+    
+    def render(self, save_path=None):
+        """Render the current state of the environment"""
+        import matplotlib.pyplot as plt
+        
+        fig, ax = plt.subplots(figsize=(12, 10))
+        
+        # Plot disaster zones
+        for zone in self.disaster_zones:
+            circle = plt.Circle(zone.center, zone.radius, 
+                              alpha=0.3, color='red' if zone.severity > 0.7 else 'orange')
+            ax.add_patch(circle)
+            
+            # Add severity text
+            ax.text(zone.center[0], zone.center[1], f'S:{zone.severity:.1f}\nC:{zone.coverage_status:.2f}',
+                   ha='center', va='center', fontsize=8)
+        
+        # Plot UAVs
+        colors = ['blue', 'green', 'purple']
+        for i, uav in enumerate(self.uavs):
+            ax.scatter(uav.pos[0], uav.pos[1], c=colors[i], s=100, 
+                      label=f'UAV {i+1} (B:{uav.battery_level:.1f}%)')
+        
+        # Plot communication links
+        if hasattr(self.sim, 'links') and self.sim.links:
+            for link in self.sim.links:
+                pos1 = link.drone1.pos
+                pos2 = link.drone2.pos
+                ax.plot([pos1[0], pos2[0]], [pos1[1], pos2[1]], 'k--', alpha=0.5)
+        
+        ax.set_xlim(0, 20000)
+        ax.set_ylim(0, 20000)
+        ax.set_xlabel('X Position (m)')
+        ax.set_ylabel('Y Position (m)')
+        ax.set_title(f'Disaster Coverage Environment\nTotal Coverage: {self.total_coverage:.3f}')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        
+        if save_path:
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        else:
+            plt.show()
+        
+        plt.close()
+    
+    def reset(self, deterministic=False, fixed_positions=None):
+        """Reset environment
+        
+        Args:
+            deterministic: If True, use fixed spawn positions for reproducible evaluation
+            fixed_positions: List of fixed positions to use when deterministic=True
+        """
+        num_uavs = len(self.uavs)
+        
+        if deterministic and fixed_positions is not None:
+            # Use fixed positions for deterministic evaluation
+            start_positions = fixed_positions[:num_uavs]
+            # Pad with random positions if needed
+            while len(start_positions) < num_uavs:
+                x = np.random.uniform(1000, 19000)
+                y = np.random.uniform(1000, 19000)
+                start_positions.append([x, y])
+        else:
+            # Generate random spawn positions
+            start_positions = []
+            for _ in range(num_uavs):
+                x = np.random.uniform(1000, 19000)
+                y = np.random.uniform(1000, 19000)
+                start_positions.append([x, y])
         
         for i, uav in enumerate(self.uavs):
             uav.pos = start_positions[i].copy()
@@ -462,3 +564,63 @@ class DisasterCoverageEnvironment:
         
         plt.close()
 
+    def run_validation_eval(self, agents, seed, eval_name):
+        """Run a deterministic evaluation with fixed seed"""
+        print("\n" + "="*60)
+        print("HONEST EVALUATION: Running validation tests...")
+        print("="*60)       
+        print(f"\nRunning {eval_name} with seed {seed}...")
+        
+        # Set seeds for deterministic behavior
+        np.random.seed(seed)
+        random.seed(seed)
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        
+        # Recreate disaster zones deterministically for evaluation
+        self.disaster_zones = self._create_disaster_zones(deterministic=True, seed=seed)
+        
+        # Generate fixed spawn positions for deterministic evaluation
+        num_uavs = self.config.NUM_UAVS
+        fixed_positions = []
+        for i in range(num_uavs):
+            # Use seed-based deterministic positioning
+            np.random.seed(seed + i)  # Different seed for each UAV
+            x = np.random.uniform(1000, 19000)
+            y = np.random.uniform(1000, 19000)
+            fixed_positions.append([x, y])
+        
+        # Reset with deterministic positioning
+        states = self.reset(deterministic=True, fixed_positions=fixed_positions)
+        total_reward = 0.0
+        total_coverage = 0.0
+        
+        for step in range(self.config.EPISODE_LENGTH):
+            actions = {}
+            for agent_id, agent in agents.items():
+                if agent_id in states:
+                    action = agent.select_action(states[agent_id], noise_scale=0.0)  # NO NOISE
+                    actions[agent_id] = action
+            
+            new_states, rewards, done = self.step(actions)
+            
+            # Calculate coverage
+            drone_positions = [uav.pos for uav in self.uavs]
+            total_coverage_step = 0.0
+            for zone in self.disaster_zones:
+                coverage = zone.update_coverage(drone_positions)
+                total_coverage_step += coverage * zone.severity
+            avg_coverage_step = total_coverage_step / len(self.disaster_zones) if self.disaster_zones else 0.0
+            
+            total_reward += np.mean(list(rewards.values()))
+            total_coverage += avg_coverage_step
+            states = new_states
+        
+        avg_reward = total_reward / self.config.EPISODE_LENGTH
+        avg_coverage = total_coverage / self.config.EPISODE_LENGTH
+        
+        print(f"{eval_name} Results:")
+        print(f"  Average Reward: {avg_reward:.2f}")
+        print(f"  Average Coverage: {avg_coverage:.3f}")
+        
+        return avg_reward, avg_coverage

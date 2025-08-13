@@ -6,7 +6,7 @@ class Config:
     # Environment settings
     NUM_UAVS = 6
     EPISODE_LENGTH = 400
-    TRAINING_EPISODES = 1000  # Balanced training time for gradual penalty learning
+    TRAINING_EPISODES = 500 
     
     # Learning parameters
     LEARNING_RATE = 0.001
@@ -18,11 +18,15 @@ class Config:
     FINAL_NOISE = 0.01
     NOISE_DECAY = 0.001
     
+    # State and action dimensions
+    STATE_DIM = 13  
+    ACTION_DIM = 2
+    
     # Reward parameters
     ZONE_REWARD = 500.0
     PROXIMITY_REWARD = 100.0
-    BOUNDARY_PENALTY = 50.0  # Much milder penalty - reduced from 200.0
-    BOUNDARY_MARGIN = 500  # Much smaller margin - reduced from 1500
+    BOUNDARY_PENALTY = 50.0  
+    BOUNDARY_MARGIN = 500  
     
     # Environment dimensions
     ENV_WIDTH = 20000
