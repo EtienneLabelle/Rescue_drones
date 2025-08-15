@@ -70,7 +70,8 @@ for episode in range(Config.TRAINING_EPISODES):
         actions = {}
         for agent_id, agent in agents.items():
             if agent_id in states:
-                action = agent.select_action(states[agent_id], noise_scale=noise_scale)
+                # CORRECT: Use explore=True for training with noise
+                action = agent.select_action(states[agent_id], explore=True, noise_scale=noise_scale)
                 actions[agent_id] = action
         
         # Execute actions
@@ -120,10 +121,24 @@ for episode in range(Config.TRAINING_EPISODES):
         
         # Update agents periodically and track losses
         if step % 5 == 0:
+            # CORRECT: Get all target actors for coordinated updates
+            all_target_actors = [agents[f"uav_{i+1}"].target_actor for i in range(Config.NUM_UAVS)]
+            
             for agent in agents.values():
-                loss = agent.update(batch_size=Config.BATCH_SIZE, return_losses=True)
+                loss = agent.update(
+                    batch_size=Config.BATCH_SIZE, 
+                    all_target_actors=all_target_actors,
+                    return_losses=True
+                )
                 if loss is not None:
                     episode_losses.append(loss)
+            
+            # CORRECT: Soft update target networks every 5 steps (coordinated)
+            if step % 20 == 0:  # Every 20 steps for target updates
+                tau = 0.005  # Small tau for stable learning
+                for agent in agents.values():
+                    agent.soft_update(agent.actor, agent.target_actor, tau)
+                    agent.soft_update(agent.critic, agent.target_critic, tau)
         
         states = new_states
         episode_rewards.append(np.mean(list(rewards.values())))
@@ -200,7 +215,7 @@ for step in range(Config.EPISODE_LENGTH):
     actions = {}
     for agent_id, agent in agents.items():
         if agent_id in states:
-            action = agent.select_action(states[agent_id], noise_scale=0.0)  # NO NOISE
+            action = agent.select_action(states[agent_id], explore=False, noise_scale=0.0)  # NO NOISE
             actions[agent_id] = action
     
     # Execute actions

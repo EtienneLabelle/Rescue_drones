@@ -599,7 +599,8 @@ class DisasterCoverageEnvironment:
             actions = {}
             for agent_id, agent in agents.items():
                 if agent_id in states:
-                    action = agent.select_action(states[agent_id], noise_scale=0.0)  # NO NOISE
+                    # CORRECT: Use explore=False for honest evaluation
+                    action = agent.select_action(states[agent_id], explore=False, noise_scale=0.0)  # NO NOISE
                     actions[agent_id] = action
             
             new_states, rewards, done = self.step(actions)

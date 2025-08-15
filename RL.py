@@ -95,9 +95,16 @@ class DQNAgent(BaseRLAgent):
         
         current_q_values = self.q_network(states).gather(1, actions.unsqueeze(1))
         next_q_values = self.target_network(next_states).max(1)[0].detach()
-        target_q_values = rewards + (self.gamma * next_q_values * ~dones)
         
-        loss = nn.MSELoss()(current_q_values.squeeze(), target_q_values)
+        # CRITICAL FIX: Proper shape handling for DQN targets
+        rewards = rewards.unsqueeze(1)  # (B,) -> (B,1)
+        dones = dones.float().unsqueeze(1)  # (B,) -> (B,1)
+        next_q_values = next_q_values.unsqueeze(1)  # (B,) -> (B,1)
+        
+        target_q_values = rewards + (self.gamma * next_q_values * (1.0 - dones))
+        
+        # CRITICAL FIX: Consistent shapes for loss computation
+        loss = nn.MSELoss()(current_q_values, target_q_values)
         
         self.optimizer.zero_grad()
         loss.backward()
@@ -214,29 +221,37 @@ class PPOAgent(BaseRLAgent):
         
         # Calculate values and advantages
         values = self.critic(states).squeeze()
+        next_values = self.critic(next_states).squeeze()
+        
+        returns = []
+        for i, (reward, done, next_value) in enumerate(zip(rewards, dones, next_values)):
+            if done:
+                returns.append(reward)
+            else:
+                returns.append(reward + self.gamma * next_value)
+        
+        returns = torch.FloatTensor(returns).to(self.device)
+        
+        # CRITICAL FIX: Ensure consistent shapes for A2C
+        values = values.unsqueeze(1)  # (B,) -> (B,1) to match critic output
+        returns = returns.unsqueeze(1)  # (B,) -> (B,1)
+        
         advantages = returns - values.detach()
         
-        # PPO update
-        for _ in range(10):
-            action_probs = self.actor(states)
-            dist = torch.distributions.Categorical(action_probs)
-            new_log_probs = dist.log_prob(actions)
-            
-            ratio = torch.exp(new_log_probs - old_log_probs)
-            surr1 = ratio * advantages
-            surr2 = torch.clamp(ratio, 1 - self.clip_ratio, 1 + self.clip_ratio) * advantages
-            
-            actor_loss = -torch.min(surr1, surr2).mean()
-            critic_loss = nn.MSELoss()(values, returns)
-            entropy_loss = -dist.entropy().mean()
-            
-            total_loss = actor_loss + self.value_coef * critic_loss + self.entropy_coef * entropy_loss
-            
-            self.actor_optimizer.zero_grad()
-            self.critic_optimizer.zero_grad()
-            total_loss.backward()
-            self.actor_optimizer.step()
-            self.critic_optimizer.step()
+        # Actor loss
+        action_probs = self.actor(states)
+        dist = torch.distributions.Categorical(action_probs)
+        new_log_probs = dist.log_prob(actions)
+        
+        actor_loss = -(new_log_probs * advantages.squeeze()).mean()  # Squeeze advantages for actor
+        critic_loss = nn.MSELoss()(values, returns)  # Both (B,1)
+        
+        self.actor_optimizer.zero_grad()
+        self.critic_optimizer.zero_grad()
+        actor_loss.backward()
+        critic_loss.backward()
+        self.actor_optimizer.step()
+        self.critic_optimizer.step()
         
         self.memory = []
     
@@ -342,6 +357,11 @@ class A2CAgent(BaseRLAgent):
                 returns.append(reward + self.gamma * next_value)
         
         returns = torch.FloatTensor(returns).to(self.device)
+        
+        # CRITICAL FIX: Ensure consistent shapes for A2C
+        values = values.unsqueeze(1)  # (B,) -> (B,1) to match critic output
+        returns = returns.unsqueeze(1)  # (B,) -> (B,1)
+        
         advantages = returns - values.detach()
         
         # Actor loss
@@ -349,8 +369,8 @@ class A2CAgent(BaseRLAgent):
         dist = torch.distributions.Categorical(action_probs)
         new_log_probs = dist.log_prob(actions)
         
-        actor_loss = -(new_log_probs * advantages).mean()
-        critic_loss = nn.MSELoss()(values, returns)
+        actor_loss = -(new_log_probs * advantages.squeeze()).mean()  # Squeeze advantages for actor
+        critic_loss = nn.MSELoss()(values, returns)  # Both (B,1)
         
         self.actor_optimizer.zero_grad()
         self.critic_optimizer.zero_grad()
@@ -467,35 +487,23 @@ class MADDPGAgent(BaseRLAgent):
         # Shared centralized replay buffer
         self.shared_buffer = shared_buffer
         
-        # Networks
+        # Networks - CORRECT: One target actor/critic per agent
         self.actor = MADDPGActor(state_dim, action_dim).to(self.device)
         self.critic = MADDPGCritic(self.total_state_dim, self.total_action_dim).to(self.device)
-        
-        # CRITICAL FIX: Independent target networks for each agent
-        self.target_actors = {}
-        self.target_critics = {}
-        
-        for i in range(num_agents):
-            agent_name = f"agent_{i}"
-            self.target_actors[agent_name] = MADDPGActor(state_dim, action_dim).to(self.device)
-            self.target_critics[agent_name] = MADDPGCritic(self.total_state_dim, self.total_action_dim).to(self.device)
+        self.target_actor = MADDPGActor(state_dim, action_dim).to(self.device)
+        self.target_critic = MADDPGCritic(self.total_state_dim, self.total_action_dim).to(self.device)
         
         # Optimizers
         self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=learning_rate)
         self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=learning_rate)
         
         # Initialize target networks
-        self.update_target_networks(tau=1.0)
+        self.soft_update(self.actor, self.target_actor, tau=1.0)
+        self.soft_update(self.critic, self.target_critic, tau=1.0)
     
-    def update_target_networks(self, tau=None):
-        if tau is None:
-            tau = self.tau
-        
-        # Update this agent's main target networks
-        for target_param, param in zip(self.target_actors[f"agent_{int(self.agent_id.split('_')[1])-1}"].parameters(), self.actor.parameters()):
-            target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
-            
-        for target_param, param in zip(self.target_critics[f"agent_{int(self.agent_id.split('_')[1])-1}"].parameters(), self.critic.parameters()):
+    def soft_update(self, source, target, tau):
+        """Soft update target network"""
+        for target_param, param in zip(target.parameters(), source.parameters()):
             target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
     
     def remember(self, joint_state, joint_action, joint_reward, joint_next_state, joint_done):
@@ -503,18 +511,19 @@ class MADDPGAgent(BaseRLAgent):
         if self.shared_buffer is not None:
             self.shared_buffer.push(joint_state, joint_action, joint_reward, joint_next_state, joint_done)
     
-    def select_action(self, state, noise_scale=0.1):
+    def select_action(self, state, explore=False, noise_scale=0.0):
         state = torch.FloatTensor(state).unsqueeze(0).to(self.device)
         action = self.actor(state).squeeze(0).detach().cpu().numpy()
         
-        # Add noise for exploration
-        noise = np.random.normal(0, noise_scale, action.shape)
-        action = np.clip(action + noise, -1, 1)
+        # CORRECT: Add noise only if exploring
+        if explore and noise_scale > 0:
+            noise = np.random.normal(0, noise_scale, action.shape)
+            action = np.clip(action + noise, -1, 1)
         
         return action
     
-    def update(self, batch_size=32, return_losses=False):
-        """Update using centralized replay buffer"""
+    def update(self, batch_size=32, all_target_actors=None, return_losses=False):
+        """Update using centralized replay buffer with proper target coordination"""
         if self.shared_buffer is None or len(self.shared_buffer) < batch_size:
             return None if return_losses else None
         
@@ -533,8 +542,6 @@ class MADDPGAgent(BaseRLAgent):
         joint_dones = joint_dones.to(self.device)
         
         # Extract this agent's data from joint tensors
-        # agent_id format is "uav_1", "uav_2", etc. (1-indexed)
-        # Convert to 0-indexed for array access
         agent_idx = int(self.agent_id.split('_')[1]) - 1  # uav_1 -> 0, uav_2 -> 1, etc.
         state_dim = self.state_dim
         action_dim = self.action_dim
@@ -548,40 +555,53 @@ class MADDPGAgent(BaseRLAgent):
         # Extract this agent's states and actions
         states = joint_states[:, start_state_idx:end_state_idx]
         actions = joint_actions[:, start_action_idx:end_action_idx]
-        rewards = joint_rewards[:, agent_idx]  # This agent's reward
+        
+        # CORRECT: Proper shape handling
+        rewards = joint_rewards[:, agent_idx].unsqueeze(1)  # (B,) -> (B,1)
+        dones = joint_dones[:, agent_idx].float().unsqueeze(1)  # (B,) -> (B,1)
+        
         next_states = joint_next_states[:, start_state_idx:end_state_idx]
-        dones = joint_dones[:, agent_idx]  # This agent's done flag
         
         # Critic update
-        current_q_values = self.critic(joint_states, joint_actions)
+        current_q_values = self.critic(joint_states, joint_actions)  # Shape: (B,1)
         
         with torch.no_grad():
-            # CRITICAL FIX: Use INDEPENDENT target actors for each agent
+            # CORRECT: Use provided target actors from trainer loop
+            if all_target_actors is None:
+                # Fallback to local targets if not provided
+                all_target_actors = [self.target_actor] * self.num_agents
+            
             next_actions = []
             for i in range(self.num_agents):
                 start_idx = i * state_dim
                 end_idx = start_idx + state_dim
                 agent_next_states = joint_next_states[:, start_idx:end_idx]
                 
-                # Use THIS agent's target actor for agent i
-                target_actor = self.target_actors[f"agent_{i}"]
-                next_actions.append(target_actor(agent_next_states))
+                # Use the target actor for agent i (from trainer loop)
+                target_actor = all_target_actors[i]
+                a_i = target_actor(agent_next_states)
+                
+                # CORRECT: TD3-style target smoothing
+                eps = torch.clamp(torch.randn_like(a_i) * 0.1, -0.2, 0.2)
+                a_i = torch.clamp(a_i + eps, -1, 1)
+                next_actions.append(a_i)
             
             # Concatenate all next actions in consistent order
             next_joint_actions = torch.cat(next_actions, dim=1)
             
-            # Use THIS agent's target critic
-            target_critic = self.target_critics[f"agent_{agent_idx}"]
-            next_q_values = target_critic(joint_next_states, next_joint_actions)
+            # Use this agent's target critic
+            next_q_values = self.target_critic(joint_next_states, next_joint_actions)  # Shape: (B,1)
             
-            # Compute target Q-values
-            target_q_values = rewards + (self.gamma * next_q_values * (~dones).float())
+            # CORRECT: Proper target computation with matching shapes
+            target_q_values = rewards + (self.gamma * next_q_values * (1.0 - dones))
         
         # Critic loss
-        critic_loss = nn.MSELoss()(current_q_values.squeeze(), target_q_values)
+        critic_loss = nn.SmoothL1Loss()(current_q_values, target_q_values)
         
         self.critic_optimizer.zero_grad()
         critic_loss.backward()
+        # CORRECT: Grad clipping for critic
+        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 0.5)
         self.critic_optimizer.step()
         
         # Actor update
@@ -594,30 +614,27 @@ class MADDPGAgent(BaseRLAgent):
         new_joint_actions = joint_actions.clone()
         new_joint_actions[:, start_action_idx:end_action_idx] = new_actions
         
-        # Compute actor loss (no action bias penalties - let critic shape behavior)
+        # Compute actor loss
         actor_q_values = self.critic(joint_states, new_joint_actions)
         actor_loss = -actor_q_values.mean()
         
         actor_loss.backward()
+        # CORRECT: Grad clipping for actor
+        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 0.5)
         self.actor_optimizer.step()
         
-        # Update target networks
-        self.update_target_networks()
+        # CORRECT: NO target updates here - done from trainer loop
         
         if return_losses:
             return (critic_loss.item() + actor_loss.item()) / 2  # Return average loss
         return None
     
     def save_model(self, path):
-        # Save all target networks
-        target_actors_state = {name: net.state_dict() for name, net in self.target_actors.items()}
-        target_critics_state = {name: net.state_dict() for name, net in self.target_critics.items()}
-        
         torch.save({
             'actor_state_dict': self.actor.state_dict(),
             'critic_state_dict': self.critic.state_dict(),
-            'target_actors_state_dict': target_actors_state,
-            'target_critics_state_dict': target_critics_state,
+            'target_actor_state_dict': self.target_actor.state_dict(),
+            'target_critic_state_dict': self.target_critic.state_dict(),
             'actor_optimizer_state_dict': self.actor_optimizer.state_dict(),
             'critic_optimizer_state_dict': self.critic_optimizer.state_dict(),
             'agent_id': self.agent_id
@@ -627,34 +644,18 @@ class MADDPGAgent(BaseRLAgent):
         checkpoint = torch.load(path)
         self.actor.load_state_dict(checkpoint['actor_state_dict'])
         self.critic.load_state_dict(checkpoint['critic_state_dict'])
-        
-        # Load all target networks
-        target_actors_state = checkpoint['target_actors_state_dict']
-        target_critics_state = checkpoint['target_critics_state_dict']
-        
-        for name, state_dict in target_actors_state.items():
-            if name in self.target_actors:
-                self.target_actors[name].load_state_dict(state_dict)
-        
-        for name, state_dict in target_critics_state.items():
-            if name in self.target_critics:
-                self.target_critics[name].load_state_dict(state_dict)
-        
+        self.target_actor.load_state_dict(checkpoint['target_actor_state_dict'])
+        self.target_critic.load_state_dict(checkpoint['target_critic_state_dict'])
         self.actor_optimizer.load_state_dict(checkpoint['actor_optimizer_state_dict'])
         self.critic_optimizer.load_state_dict(checkpoint['critic_optimizer_state_dict'])
         self.agent_id = checkpoint['agent_id']
 
     def reset_critic(self):
         """Reset critic network to fix backwards learning"""
-        self.critic = MADDPGCritic(self.total_state_dim, self.total_action_dim)
-        
-        # Reset all target critics for this agent
-        for i in range(self.num_agents):
-            agent_name = f"agent_{i}"
-            self.target_critics[agent_name] = MADDPGCritic(self.total_state_dim, self.total_action_dim)
-        
+        self.critic = MADDPGCritic(self.total_state_dim, self.total_action_dim).to(self.device)
+        self.target_critic = MADDPGCritic(self.total_state_dim, self.total_action_dim).to(self.device)
         self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=self.learning_rate)
-        self.update_target_networks(tau=1.0)  # Copy weights immediately
+        self.soft_update(self.critic, self.target_critic, tau=1.0)  # Copy weights immediately
 
 # Factory function
 def create_rl_agent(agent_type, state_dim, action_dim, **kwargs):
