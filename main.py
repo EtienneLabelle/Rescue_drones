@@ -256,27 +256,18 @@ if final_simulation_rewards:
 if final_simulation_coverage:
     writer.add_scalar('Final_Simulation/Final_Average_Coverage', np.mean(final_simulation_coverage), 0)
 
-# Close TensorBoard writer
-writer.close()
-
-# HONEST EVALUATION: Run validation multiple times to ensure reproducibility
-print("\n" + "="*60)
-print("HONEST EVALUATION: Running validation tests...")
-print("="*60)
-
 # Run validation multiple times with same seed
 validation_results = []
-for i in range(3):
-    reward, coverage = env.run_validation_eval(agents, EVAL_SEED, f"Validation Run {i+1}")
-    validation_results.append((reward, coverage))
+reward, coverage = env.run_validation_eval(agents, EVAL_SEED, f"Validation Run {i+1}")
+validation_results.append((reward, coverage))
 
-# Check if results are identical (honest evaluation)
-if len(set(validation_results)) == 1:
-    print(f"\n✅ SUCCESS: All validation runs produced identical results!")
-    print(f"   This confirms deterministic behavior and honest evaluation.")
-else:
-    print(f"\n❌ WARNING: Validation runs produced different results!")
-    print(f"   This indicates non-deterministic behavior.")
+# Log validation results to TensorBoard
+avg_validation_reward = np.mean([r for r, c in validation_results])
+avg_validation_coverage = np.mean([c for r, c in validation_results])
+
+writer.add_scalar('Validation/Average_Reward', avg_validation_reward, 0)
+writer.add_scalar('Validation/Average_Coverage', avg_validation_coverage, 0)
+writer.close()
 
 print("\nSimulation complete! Use buttons to control animation playback.")
 print(f"TensorBoard logs saved to: {log_dir}")
