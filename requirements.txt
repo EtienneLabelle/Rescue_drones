@@ -4,3 +4,4 @@ matplotlib>=3.5.0
 tk
 scipy>=1.7.0
 tensorboard>=2.8.0 
+pytest>=7.0.0

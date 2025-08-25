@@ -28,6 +28,11 @@ class Config:
     BOUNDARY_PENALTY = 50.0  
     BOUNDARY_MARGIN = 500  
     
+    # Reward normalization settings
+    NORMALIZE_REWARDS = True
+    NORM_WARMUP = 10
+    NORM_CLIP = 3.0
+    
     # Environment dimensions
     ENV_WIDTH = 20000
     ENV_HEIGHT = 20000

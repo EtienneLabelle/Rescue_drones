@@ -1,4 +1,4 @@
-# env/grid.py       
+# env.py       
 import random
 import numpy as np
 from coms import Link
@@ -110,6 +110,18 @@ class DisasterCoverageEnvironment:
         # Communication links between UAVs
         self.sim.drones = self.uavs
         self.sim.create_links()
+        
+        # Reward normalization infrastructure
+        self.reward_stats = {
+            'count': 0,
+            'mean': 0.0,
+            'std': 1.0,
+            'sum': 0.0,
+            'sum_sq': 0.0
+        }
+        self.normalize_rewards = getattr(config, 'NORMALIZE_REWARDS', True)
+        self.norm_warmup = getattr(config, 'NORM_WARMUP', 10)
+        self.norm_clip = getattr(config, 'NORM_CLIP', 3.0)
     
     def _create_disaster_zones(self, deterministic=False, seed=None):
         """Create disaster zones in the environment
@@ -313,12 +325,23 @@ class DisasterCoverageEnvironment:
         for uav in self.uavs:
             # Get movement magnitude for this UAV
             movement_magnitude = getattr(uav, 'last_movement_magnitude', 0)
-            reward = self._calculate_reward(uav, movement_magnitude)
-            rewards[uav.id] = reward
+            raw_reward = self._calculate_reward(uav, movement_magnitude)
+            
+            # Always update stats, but only normalize if enabled
+            if self.normalize_rewards:
+                normalized_reward = self._normalize_reward(raw_reward)
+                rewards[uav.id] = normalized_reward
+            else:
+                # Just update stats without normalization
+                self._update_reward_stats(raw_reward)
+                rewards[uav.id] = raw_reward
             
             # Debug: Print reward values to see if they're reasonable
             if self.episode_steps % 50 == 0:  # Print every 50 steps
-                print(f"UAV {uav.id}: Reward = {reward:.2f}, Pos = {uav.pos}, Movement = {movement_magnitude:.2f}")
+                if self.normalize_rewards:
+                    print(f"UAV {uav.id}: Raw Reward = {raw_reward:.2f}, Normalized = {rewards[uav.id]:.2f}, Pos = {uav.pos}, Movement = {movement_magnitude:.2f}")
+                else:
+                    print(f"UAV {uav.id}: Raw Reward = {raw_reward:.2f} (no norm), Pos = {uav.pos}, Movement = {movement_magnitude:.2f}")
         
         self.episode_steps += 1
         done = self.episode_steps >= self.max_steps
@@ -368,6 +391,33 @@ class DisasterCoverageEnvironment:
             uav.prev_distance_to_zone = current_distance
         
         return reward
+    
+    def _update_reward_stats(self, reward):
+        """Update running statistics for reward normalization"""
+        self.reward_stats['count'] += 1
+        self.reward_stats['sum'] += reward
+        self.reward_stats['sum_sq'] += reward ** 2
+        
+        # Update mean
+        self.reward_stats['mean'] = self.reward_stats['sum'] / self.reward_stats['count']
+        
+        # Update standard deviation (with Bessel's correction)
+        if self.reward_stats['count'] > 1:
+            variance = (self.reward_stats['sum_sq'] - (self.reward_stats['sum'] ** 2) / self.reward_stats['count']) / (self.reward_stats['count'] - 1)
+            self.reward_stats['std'] = max(np.sqrt(variance), 1e-8)  # Prevent division by zero
+    
+    def _normalize_reward(self, reward):
+        """Normalize reward using running statistics with warm-up and clipping"""
+        # Always update stats first
+        self._update_reward_stats(reward)
+        
+        # Warm-up: until we have enough samples, return raw reward
+        if (not self.normalize_rewards) or (self.reward_stats['count'] < self.norm_warmup):
+            return reward
+        
+        # Normalize and clip
+        normalized = (reward - self.reward_stats['mean']) / self.reward_stats['std']
+        return float(np.clip(normalized, -self.norm_clip, self.norm_clip))
     
     def reset(self):
         """Reset environment"""
@@ -498,6 +548,15 @@ class DisasterCoverageEnvironment:
         # Reset tracking variables
         self.total_coverage = 0.0
         self.episode_steps = 0
+        
+        # Reset reward normalization stats for new episode
+        self.reward_stats = {
+            'count': 0,
+            'mean': 0.0,
+            'std': 1.0,
+            'sum': 0.0,
+            'sum_sq': 0.0
+        }
         
         # Recreate communication links
         self.sim.drones = self.uavs
