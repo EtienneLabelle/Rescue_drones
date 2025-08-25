@@ -32,6 +32,9 @@ class Config:
     NORMALIZE_REWARDS = True
     NORM_WARMUP = 10
     NORM_CLIP = 3.0
+    NORM_EMA_BETA = 0.99  # EMA decay factor for non-stationarity handling
+    NORM_RAMP_STEPS = 20  # Gradual ramp-up steps after warmup
+    RAW_REWARD_CLIP = 1000.0  # Clip raw rewards before normalization
     
     # Environment dimensions
     ENV_WIDTH = 20000
@@ -43,4 +46,10 @@ class Config:
     BANDWIDTH = 20e6   # 20 MHz
     TRANSMIT_POWER = 30  # dBm
     MIN_RECEIVE_POWER = -80  # dBm
-    NOISE_POWER = -90  # dBm 
+    NOISE_POWER = -90  # dBm
+    
+    # Logging settings
+    VERBOSE_LOGGING = False  # Enable debug output (impacts performance)
+    
+    # Reproducibility settings
+    RANDOM_SEED = None  # Set to integer for reproducible results 

@@ -111,17 +111,27 @@ class DisasterCoverageEnvironment:
         self.sim.drones = self.uavs
         self.sim.create_links()
         
-        # Reward normalization infrastructure
-        self.reward_stats = {
-            'count': 0,
-            'mean': 0.0,
-            'std': 1.0,
-            'sum': 0.0,
-            'sum_sq': 0.0
-        }
+        # Reward normalization infrastructure - PER-AGENT stats
+        self.reward_stats = {}  # Dict keyed by uav.id for per-agent stats
         self.normalize_rewards = getattr(config, 'NORMALIZE_REWARDS', True)
         self.norm_warmup = getattr(config, 'NORM_WARMUP', 10)
         self.norm_clip = getattr(config, 'NORM_CLIP', 3.0)
+        self.ema_beta = getattr(config, 'NORM_EMA_BETA', 0.99)  # EMA decay factor
+        
+        # Initialize per-agent stats
+        self._init_per_agent_stats()
+    
+    def _init_per_agent_stats(self):
+        """Initialize reward statistics for each UAV agent"""
+        for uav in self.uavs:
+            self.reward_stats[uav.id] = {
+                'count': 0,
+                'mean': 0.0,
+                'std': 1.0,
+                'ema_mean': 0.0,
+                'ema_var': 1.0,
+                'm2': 0.0  # For Welford's algorithm
+            }
     
     def _create_disaster_zones(self, deterministic=False, seed=None):
         """Create disaster zones in the environment
@@ -329,19 +339,24 @@ class DisasterCoverageEnvironment:
             
             # Always update stats, but only normalize if enabled
             if self.normalize_rewards:
-                normalized_reward = self._normalize_reward(raw_reward)
+                normalized_reward = self._normalize_reward(uav.id, raw_reward)
                 rewards[uav.id] = normalized_reward
             else:
                 # Just update stats without normalization
-                self._update_reward_stats(raw_reward)
+                self._update_reward_stats(uav.id, raw_reward)
                 rewards[uav.id] = raw_reward
             
-            # Debug: Print reward values to see if they're reasonable
-            if self.episode_steps % 50 == 0:  # Print every 50 steps
+            # Debug: Log reward values (only when verbose logging is enabled)
+            if self.episode_steps % 50 == 0 and getattr(self.config, 'VERBOSE_LOGGING', False):
                 if self.normalize_rewards:
-                    print(f"UAV {uav.id}: Raw Reward = {raw_reward:.2f}, Normalized = {rewards[uav.id]:.2f}, Pos = {uav.pos}, Movement = {movement_magnitude:.2f}")
+                    # Use proper logging instead of print for performance
+                    import logging
+                    logger = logging.getLogger(__name__)
+                    logger.debug(f"UAV {uav.id}: Raw={raw_reward:.2f}, Norm={rewards[uav.id]:.2f}, Pos={uav.pos}, Move={movement_magnitude:.2f}")
                 else:
-                    print(f"UAV {uav.id}: Raw Reward = {raw_reward:.2f} (no norm), Pos = {uav.pos}, Movement = {movement_magnitude:.2f}")
+                    import logging
+                    logger = logging.getLogger(__name__)
+                    logger.debug(f"UAV {uav.id}: Raw={raw_reward:.2f} (no norm), Pos={uav.pos}, Move={movement_magnitude:.2f}")
         
         self.episode_steps += 1
         done = self.episode_steps >= self.max_steps
@@ -392,31 +407,72 @@ class DisasterCoverageEnvironment:
         
         return reward
     
-    def _update_reward_stats(self, reward):
-        """Update running statistics for reward normalization"""
-        self.reward_stats['count'] += 1
-        self.reward_stats['sum'] += reward
-        self.reward_stats['sum_sq'] += reward ** 2
+    def _update_reward_stats(self, uav_id, reward):
+        """Update reward statistics using Welford's algorithm and EMA for stability"""
+        if uav_id not in self.reward_stats:
+            self.reward_stats[uav_id] = {
+                'count': 0,
+                'mean': 0.0,
+                'std': 1.0,
+                'ema_mean': 0.0,
+                'ema_var': 1.0,
+                'm2': 0.0  # For Welford's algorithm
+            }
+
+        stats = self.reward_stats[uav_id]
+        stats['count'] += 1
         
-        # Update mean
-        self.reward_stats['mean'] = self.reward_stats['sum'] / self.reward_stats['count']
+        # Welford's algorithm for numerical stability
+        delta = reward - stats['mean']
+        stats['mean'] += delta / stats['count']
+        delta2 = reward - stats['mean']
+        stats['m2'] += delta * delta2
         
-        # Update standard deviation (with Bessel's correction)
-        if self.reward_stats['count'] > 1:
-            variance = (self.reward_stats['sum_sq'] - (self.reward_stats['sum'] ** 2) / self.reward_stats['count']) / (self.reward_stats['count'] - 1)
-            self.reward_stats['std'] = max(np.sqrt(variance), 1e-8)  # Prevent division by zero
+        # Update standard deviation
+        if stats['count'] > 1:
+            stats['std'] = max(np.sqrt(stats['m2'] / (stats['count'] - 1)), 1e-8)
+        
+        # EMA updates for non-stationarity handling
+        if stats['count'] == 1:
+            stats['ema_mean'] = reward
+            stats['ema_var'] = 1.0
+        else:
+            # EMA mean update
+            stats['ema_mean'] = self.ema_beta * stats['ema_mean'] + (1 - self.ema_beta) * reward
+            
+            # EMA variance update (using squared error)
+            squared_error = (reward - stats['ema_mean']) ** 2
+            stats['ema_var'] = self.ema_beta * stats['ema_var'] + (1 - self.ema_beta) * squared_error
     
-    def _normalize_reward(self, reward):
-        """Normalize reward using running statistics with warm-up and clipping"""
+    def _normalize_reward(self, uav_id, reward):
+        """Normalize reward using EMA-based statistics with warm-up and clipping"""
         # Always update stats first
-        self._update_reward_stats(reward)
+        self._update_reward_stats(uav_id, reward)
         
         # Warm-up: until we have enough samples, return raw reward
-        if (not self.normalize_rewards) or (self.reward_stats['count'] < self.norm_warmup):
+        if (not self.normalize_rewards) or (self.reward_stats[uav_id]['count'] < self.norm_warmup):
             return reward
         
-        # Normalize and clip
-        normalized = (reward - self.reward_stats['mean']) / self.reward_stats['std']
+        # Clip raw reward before normalization to handle heavy tails
+        raw_clip_threshold = getattr(self.config, 'RAW_REWARD_CLIP', 1000.0)
+        clipped_reward = np.clip(reward, -raw_clip_threshold, raw_clip_threshold)
+        
+        # Use EMA statistics for normalization (more adaptive to non-stationarity)
+        stats = self.reward_stats[uav_id]
+        ema_std = max(np.sqrt(stats['ema_var']), 1e-8)
+        
+        # Gradual ramp-up to prevent volatile z-scores after warmup
+        ramp_steps = getattr(self.config, 'NORM_RAMP_STEPS', 20)
+        if stats['count'] < self.norm_warmup + ramp_steps:
+            # Linear interpolation from raw reward to normalized reward
+            alpha = (stats['count'] - self.norm_warmup) / ramp_steps
+            raw_normalized = (clipped_reward - stats['ema_mean']) / ema_std
+            normalized = alpha * raw_normalized + (1 - alpha) * clipped_reward
+        else:
+            # Full normalization after ramp-up
+            normalized = (clipped_reward - stats['ema_mean']) / ema_std
+        
+        # Clip to prevent extreme values
         return float(np.clip(normalized, -self.norm_clip, self.norm_clip))
     
     def reset(self):
@@ -447,6 +503,9 @@ class DisasterCoverageEnvironment:
         # Recreate communication links
         self.sim.drones = self.uavs
         self.sim.create_links()
+        
+        # Reset reward normalization stats for new episode
+        self._init_per_agent_stats()
         
         # Return initial states
         initial_states = {}
@@ -550,13 +609,7 @@ class DisasterCoverageEnvironment:
         self.episode_steps = 0
         
         # Reset reward normalization stats for new episode
-        self.reward_stats = {
-            'count': 0,
-            'mean': 0.0,
-            'std': 1.0,
-            'sum': 0.0,
-            'sum_sq': 0.0
-        }
+        self._init_per_agent_stats()
         
         # Recreate communication links
         self.sim.drones = self.uavs

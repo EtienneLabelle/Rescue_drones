@@ -13,6 +13,15 @@ import random
 # Evaluation seed for reproducible final testing
 EVAL_SEED = 42
 
+# Set random seed for reproducibility if configured
+if Config.RANDOM_SEED is not None:
+    np.random.seed(Config.RANDOM_SEED)
+    random.seed(Config.RANDOM_SEED)
+    torch.manual_seed(Config.RANDOM_SEED)
+    print(f"Using fixed seed: {Config.RANDOM_SEED}")
+else:
+    print("Using random seed for training")
+
 # Create TensorBoard writer
 log_dir = f"runs/drone_simulation_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 writer = SummaryWriter(log_dir)
