@@ -507,6 +507,14 @@ class DisasterCoverageEnvironment:
         # Reset reward normalization stats for new episode
         self._init_per_agent_stats()
         
+        # Recompute baseline coverage from current positions before returning states
+        drone_positions = [uav.pos for uav in self.uavs]
+        total_coverage = 0.0
+        for zone in self.disaster_zones:
+            coverage = zone.update_coverage(drone_positions)
+            total_coverage += coverage * zone.severity
+        self.total_coverage = total_coverage / len(self.disaster_zones) if self.disaster_zones else 0.0
+
         # Return initial states
         initial_states = {}
         for uav in self.uavs:
@@ -615,6 +623,14 @@ class DisasterCoverageEnvironment:
         self.sim.drones = self.uavs
         self.sim.create_links()
         
+        # Recompute baseline coverage from current positions before returning states
+        drone_positions = [uav.pos for uav in self.uavs]
+        total_coverage = 0.0
+        for zone in self.disaster_zones:
+            coverage = zone.update_coverage(drone_positions)
+            total_coverage += coverage * zone.severity
+        self.total_coverage = total_coverage / len(self.disaster_zones) if self.disaster_zones else 0.0
+
         # Return initial states
         initial_states = {}
         for uav in self.uavs:

@@ -626,7 +626,7 @@ class MADDPGAgent(BaseRLAgent):
         # CORRECT: NO target updates here - done from trainer loop
         
         if return_losses:
-            return (critic_loss.item() + actor_loss.item()) / 2  # Return average loss
+            return float(critic_loss.item())
         return None
     
     def save_model(self, path):

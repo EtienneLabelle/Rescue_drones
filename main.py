@@ -3,6 +3,7 @@ from display import SimpleAnimator
 import tkinter as tk
 import numpy as np
 from RL import MADDPGAgent, CentralizedReplayBuffer
+from features.obs import build_obs_dict
 from config import Config
 import torch
 from torch.utils.tensorboard import SummaryWriter
@@ -66,6 +67,9 @@ episode_coverage_history = []
 for episode in range(Config.TRAINING_EPISODES):
     # Reset environment
     states = env.reset()
+    states_vec = build_obs_dict(states, Config)
+    first = next(iter(states_vec.values()))
+    assert first.shape[0] == Config.STATE_DIM, f"STATE_DIM mismatch: got {first.shape[0]} vs {Config.STATE_DIM}"
     episode_rewards = []
     episode_losses = []
     episode_coverage = []
@@ -78,13 +82,16 @@ for episode in range(Config.TRAINING_EPISODES):
         # Get actions from agents
         actions = {}
         for agent_id, agent in agents.items():
-            if agent_id in states:
+            if agent_id in states_vec:
                 # CORRECT: Use explore=True for training with noise
-                action = agent.select_action(states[agent_id], explore=True, noise_scale=noise_scale)
+                action = agent.select_action(states_vec[agent_id], explore=True, noise_scale=noise_scale)
                 actions[agent_id] = action
         
         # Execute actions
         new_states, rewards, done = env.step(actions)
+        states_vec = build_obs_dict(new_states, Config)
+        first = next(iter(states_vec.values()))
+        assert first.shape[0] == Config.STATE_DIM, f"STATE_DIM mismatch: got {first.shape[0]} vs {Config.STATE_DIM}"
         
         
         # Calculate coverage
@@ -105,11 +112,11 @@ for episode in range(Config.TRAINING_EPISODES):
         
         for i in range(Config.NUM_UAVS):
             agent_id = f"uav_{i+1}"
-            if agent_id in states and agent_id in new_states:
-                joint_state.extend(states[agent_id])
+            if agent_id in states_vec and agent_id in states_vec:
+                joint_state.extend(states_vec[agent_id])
                 joint_action.extend(actions.get(agent_id, [0, 0]))
                 joint_reward.append(rewards.get(agent_id, 0))
-                joint_next_state.extend(new_states[agent_id])
+                joint_next_state.extend(states_vec[agent_id])
                 joint_done.append(done)
             else:
                 # Fill with zeros if agent not present

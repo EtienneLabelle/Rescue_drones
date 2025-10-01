@@ -14,7 +14,9 @@ WAVELENGHT = C / FREQUENCY
 
 
 class Link:
-    def __init__(self, drone1, drone2, bandwidth, frequency, noise_power_dBm):
+    def __init__(self, drone1, drone2, bandwidth, frequency, noise_power_dBm,
+                 enable_delay=False, base_latency_ms=5.0, jitter_ms=2.0,
+                 packet_loss_prob=0.0, bandwidth_cap_bps=None):
         self.drone1 = drone1
         self.drone2 = drone2
         self.distance = self.calculate_distance()
@@ -24,6 +26,12 @@ class Link:
         self.sinr_dB = None
         self.capacity_bps = None
         self.isBlocked = False
+        # Optional realism parameters (non-breaking)
+        self.enable_delay = enable_delay
+        self.base_latency_ms = base_latency_ms
+        self.jitter_ms = jitter_ms
+        self.packet_loss_prob = packet_loss_prob
+        self.bandwidth_cap_bps = bandwidth_cap_bps
 
     def __str__(self):
         # This string will be returned whenever print(link) is called
@@ -50,8 +58,38 @@ class Link:
         if self.sinr_dB is None:
             self.calculate_sinr()
         sinr_linear = 10 ** (self.sinr_dB / 10)
-        self.capacity_bps = self.bandwidth * math.log2(1 + sinr_linear)
+        theoretical_capacity = self.bandwidth * math.log2(1 + sinr_linear)
+        if self.bandwidth_cap_bps is not None:
+            self.capacity_bps = min(theoretical_capacity, self.bandwidth_cap_bps)
+        else:
+            self.capacity_bps = theoretical_capacity
         return self.capacity_bps
+
+    def sample_latency_ms(self):
+        if not self.enable_delay:
+            return 0.0
+        # Simple jitter model: Gaussian clipped at zero
+        jitter = np.random.normal(loc=0.0, scale=self.jitter_ms)
+        latency = max(0.0, self.base_latency_ms + jitter)
+        return latency
+
+    def will_drop_packet(self):
+        if self.packet_loss_prob <= 0.0:
+            return False
+        return np.random.rand() < self.packet_loss_prob
+
+    def estimate_tx_time_ms(self, num_bytes):
+        """Estimate transmission time in milliseconds for a payload.
+        Uses current capacity and accounts for bandwidth cap if set.
+        Returns inf if capacity is zero or packet is dropped (synthetic loss).
+        """
+        if self.will_drop_packet():
+            return float('inf')
+        capacity = self.calculate_capacity()
+        if capacity <= 0:
+            return float('inf')
+        tx_seconds = (num_bytes * 8.0) / capacity
+        return 1000.0 * tx_seconds + self.sample_latency_ms()
 
     def obstacle_detection(self, obstacles):
         """

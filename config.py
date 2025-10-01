@@ -48,8 +48,29 @@ class Config:
     MIN_RECEIVE_POWER = -80  # dBm
     NOISE_POWER = -90  # dBm
     
+    # Comms realism toggles (non-breaking; used by extended Link)
+    COMMS_ENABLE_DELAY = False
+    COMMS_BASE_LATENCY_MS = 5.0
+    COMMS_JITTER_MS = 2.0
+    COMMS_PACKET_LOSS_PROB = 0.0
+    COMMS_BANDWIDTH_CAP_BPS = None  # None = use Shannon capacity
+    
     # Logging settings
     VERBOSE_LOGGING = False  # Enable debug output (impacts performance)
     
     # Reproducibility settings
     RANDOM_SEED = None  # Set to integer for reproducible results 
+
+    # Federated RL toggles (additive path; main training unaffected)
+    FRL_ENABLED = False
+    FRL_NUM_CLIENTS = 3
+    FRL_DIRICHLET_ALPHA = 0.5  # non-IID; lower = more skew
+    FRL_ASYNC = True  # async FedAvg variant
+    FRL_STALENESS_BETA = 0.5  # weight by recency
+    FRL_POISONING_RATE = 0.0  # fraction of adversarial clients
+    FRL_ROBUST_AGG = "none"  # options: none|median|trimmed
+    
+    # Energy accounting toggles
+    ENERGY_ENABLE = False
+    ENERGY_W_PER_FLOP = 5e-12
+    ENERGY_W_PER_BIT_TX = 5e-9
