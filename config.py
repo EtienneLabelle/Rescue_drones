@@ -10,7 +10,7 @@ class Config:
     
     # Learning parameters
     LEARNING_RATE = 0.001
-    BATCH_SIZE = 32
+    BATCH_SIZE = 256
     BUFFER_SIZE = 100000
     
     # Exploration parameters
@@ -19,7 +19,7 @@ class Config:
     NOISE_DECAY = 0.001
     
     # State and action dimensions
-    STATE_DIM = 13  
+    STATE_DIM = 16  # 8 zone features + 1 battery + NUM_UAVS relative distances + 1 comms
     ACTION_DIM = 2
     
     # Reward parameters
@@ -48,8 +48,9 @@ class Config:
     MIN_RECEIVE_POWER = -80  # dBm
     NOISE_POWER = -90  # dBm
     
-    # Comms realism toggles (non-breaking; used by extended Link)
-    COMMS_ENABLE_DELAY = False
+    # Comms toggles
+    COMMS_ENABLED = False          # False = skip SINR/capacity link calculations each step (faster training)
+    COMMS_ENABLE_DELAY = False     # True = add latency/jitter/packet-loss model on top of capacity calc
     COMMS_BASE_LATENCY_MS = 5.0
     COMMS_JITTER_MS = 2.0
     COMMS_PACKET_LOSS_PROB = 0.0

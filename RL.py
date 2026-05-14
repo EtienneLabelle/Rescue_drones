@@ -577,13 +577,7 @@ class MADDPGAgent(BaseRLAgent):
                 end_idx = start_idx + state_dim
                 agent_next_states = joint_next_states[:, start_idx:end_idx]
                 
-                # Use the target actor for agent i (from trainer loop)
-                target_actor = all_target_actors[i]
-                a_i = target_actor(agent_next_states)
-                
-                # CORRECT: TD3-style target smoothing
-                eps = torch.clamp(torch.randn_like(a_i) * 0.1, -0.2, 0.2)
-                a_i = torch.clamp(a_i + eps, -1, 1)
+                a_i = all_target_actors[i](agent_next_states)
                 next_actions.append(a_i)
             
             # Concatenate all next actions in consistent order
@@ -596,7 +590,7 @@ class MADDPGAgent(BaseRLAgent):
             target_q_values = rewards + (self.gamma * next_q_values * (1.0 - dones))
         
         # Critic loss
-        critic_loss = nn.SmoothL1Loss()(current_q_values, target_q_values)
+        critic_loss = nn.MSELoss()(current_q_values, target_q_values)
         
         self.critic_optimizer.zero_grad()
         critic_loss.backward()
@@ -623,8 +617,10 @@ class MADDPGAgent(BaseRLAgent):
         torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 0.5)
         self.actor_optimizer.step()
         
-        # CORRECT: NO target updates here - done from trainer loop
-        
+        # Soft update target networks (standard MADDPG: every update step)
+        self.soft_update(self.actor, self.target_actor, self.tau)
+        self.soft_update(self.critic, self.target_critic, self.tau)
+
         if return_losses:
             return float(critic_loss.item())
         return None

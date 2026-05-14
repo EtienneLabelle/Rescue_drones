@@ -264,27 +264,21 @@ class DisasterCoverageEnvironment:
     
     def _get_minimum_link_capacity(self):
         """Get minimum link capacity in Mbps, representing the bottleneck link"""
+        if not getattr(self.config, 'COMMS_ENABLED', True):
+            return 0.0
+
         if not hasattr(self.sim, 'links') or not self.sim.links:
             return 0.0
-        
+
         min_capacity = float('inf')
         valid_links = 0
-        
+
         for link in self.sim.links:
-            # Calculate capacity if not already calculated
-            if link.capacity_bps is None:
-                link.calculate_capacity()
-            
-            # Track minimum capacity if valid
             if link.capacity_bps is not None:
                 min_capacity = min(min_capacity, link.capacity_bps)
                 valid_links += 1
-        
-        # Return minimum capacity in Mbps
-        if valid_links > 0:
-            return min_capacity / 1e6
-        else:
-            return 0.0
+
+        return (min_capacity / 1e6) if valid_links > 0 else 0.0
     
     def step(self, actions):
         """Execute actions for all UAVs and return new states, rewards, done"""
@@ -296,19 +290,16 @@ class DisasterCoverageEnvironment:
                 action = actions[uav.id]
                 
                 # Convert continuous action [-1,1] to movement
-                # Scale action to reasonable movement range (further reduced to prevent corner rushing)
-                max_movement = 25  # Further reduced from 50 to prevent systematic bias
-                
-                # Simple direct action interpretation for easier learning
+                # 200m/step lets a drone cross the 20 000m map in ~100 steps (400-step episodes)
+                max_movement = 200
+
                 movement_x = action[0] * max_movement
                 movement_y = action[1] * max_movement
-                
-                # Clamp movements to prevent extreme actions
-                movement_x = np.clip(movement_x, -max_movement, max_movement)
-                movement_y = np.clip(movement_y, -max_movement, max_movement)
-                
-                # Update position
+
+                # Update position and clamp to map bounds
                 uav.move([movement_x, movement_y])
+                uav.pos[0] = np.clip(uav.pos[0], 0, self.config.ENV_WIDTH)
+                uav.pos[1] = np.clip(uav.pos[1], 0, self.config.ENV_HEIGHT)
                 
                 # Store movement magnitude for reward calculation
                 movement_magnitude = np.sqrt(movement_x**2 + movement_y**2)
@@ -328,8 +319,9 @@ class DisasterCoverageEnvironment:
         
         self.total_coverage = total_coverage / len(self.disaster_zones)
         
-        # Update communication links
-        self.sim.update_links()
+        # Update communication links (skipped when COMMS_ENABLED=False for speed)
+        if getattr(self.config, 'COMMS_ENABLED', True):
+            self.sim.update_links()
         
         # Calculate rewards
         for uav in self.uavs:
@@ -398,9 +390,9 @@ class DisasterCoverageEnvironment:
                 if uav.prev_distance_to_zone is not None:
                     delta = uav.prev_distance_to_zone - current_distance
                     if delta > 0:
-                        reward += delta * 10.0  # Reward for moving toward zone
+                        reward += delta * 1.5   # Reward for moving toward zone (~300 max at 200m/step)
                     elif delta < 0:
-                        reward += delta * 8.0   # Stronger penalty for moving away from zone
+                        reward += delta * 1.2   # Penalty for moving away from zone
             
             # 3. Update tracker for next step
             uav.prev_distance_to_zone = current_distance
@@ -615,9 +607,6 @@ class DisasterCoverageEnvironment:
         # Reset tracking variables
         self.total_coverage = 0.0
         self.episode_steps = 0
-        
-        # Reset reward normalization stats for new episode
-        self._init_per_agent_stats()
         
         # Recreate communication links
         self.sim.drones = self.uavs

@@ -10,6 +10,7 @@ from torch.utils.tensorboard import SummaryWriter
 import os
 from datetime import datetime
 import random
+import sys
 
 # Evaluation seed for reproducible final testing
 EVAL_SEED = 42
@@ -47,13 +48,6 @@ for i in range(Config.NUM_UAVS):
     )
     agents[agent_id] = agent
 
-# Setup visualization
-root = tk.Tk()
-animator = SimpleAnimator(root, env.sim.obstacles, disaster_zones=env.disaster_zones)
-animator.env = env
-
-
-
 # Training configuration
 print(f"Training {len(agents)} agents for {Config.TRAINING_EPISODES} episodes...")
 print(f"TensorBoard logs will be saved to: {log_dir}")
@@ -87,13 +81,14 @@ for episode in range(Config.TRAINING_EPISODES):
                 action = agent.select_action(states_vec[agent_id], explore=True, noise_scale=noise_scale)
                 actions[agent_id] = action
         
-        # Execute actions
+        # Execute actions — capture prev states BEFORE overwriting states_vec
+        prev_states_vec = states_vec
         new_states, rewards, done = env.step(actions)
         states_vec = build_obs_dict(new_states, Config)
         first = next(iter(states_vec.values()))
         assert first.shape[0] == Config.STATE_DIM, f"STATE_DIM mismatch: got {first.shape[0]} vs {Config.STATE_DIM}"
-        
-        
+
+
         # Calculate coverage
         drone_positions = [uav.pos for uav in env.uavs]
         total_coverage = 0.0
@@ -102,21 +97,21 @@ for episode in range(Config.TRAINING_EPISODES):
             total_coverage += coverage * zone.severity
         avg_coverage = total_coverage / len(env.disaster_zones) if env.disaster_zones else 0.0
         episode_coverage.append(avg_coverage)
-        
+
         # Create joint experience for centralized buffer
         joint_state = []
         joint_action = []
         joint_reward = []
         joint_next_state = []
         joint_done = []
-        
+
         for i in range(Config.NUM_UAVS):
             agent_id = f"uav_{i+1}"
-            if agent_id in states_vec and agent_id in states_vec:
-                joint_state.extend(states_vec[agent_id])
+            if agent_id in prev_states_vec and agent_id in states_vec:
+                joint_state.extend(prev_states_vec[agent_id])   # s  (before action)
                 joint_action.extend(actions.get(agent_id, [0, 0]))
                 joint_reward.append(rewards.get(agent_id, 0))
-                joint_next_state.extend(states_vec[agent_id])
+                joint_next_state.extend(states_vec[agent_id])   # s' (after action)
                 joint_done.append(done)
             else:
                 # Fill with zeros if agent not present
@@ -142,19 +137,12 @@ for episode in range(Config.TRAINING_EPISODES):
             
             for agent in agents.values():
                 loss = agent.update(
-                    batch_size=Config.BATCH_SIZE, 
+                    batch_size=Config.BATCH_SIZE,
                     all_target_actors=all_target_actors,
                     return_losses=True
                 )
                 if loss is not None:
                     episode_losses.append(loss)
-            
-            # CORRECT: Soft update target networks every 5 steps (coordinated)
-            if step % 20 == 0:  # Every 20 steps for target updates
-                tau = 0.005  # Small tau for stable learning
-                for agent in agents.values():
-                    agent.soft_update(agent.actor, agent.target_actor, tau)
-                    agent.soft_update(agent.critic, agent.target_critic, tau)
         
         states = new_states
         episode_rewards.append(np.mean(list(rewards.values())))
@@ -202,6 +190,12 @@ writer.add_scalar('Training/Final_Average_Coverage', np.mean(episode_coverage_hi
 
 print("Training complete! Running final simulation...")
 
+# Create visualization window now that training is done
+root = tk.Tk()
+root.protocol("WM_DELETE_WINDOW", lambda: (root.destroy(), sys.exit(0)))
+animator = SimpleAnimator(root, env.sim.obstacles, disaster_zones=env.disaster_zones)
+animator.env = env
+
 # Run final simulation with trained agents (HONEST EVALUATION - NO NOISE)
 print("Running final simulation (HONEST EVALUATION - NO NOISE)...")
 print("Using fixed seed for reproducible results...")
@@ -238,7 +232,8 @@ for step in range(Config.EPISODE_LENGTH):
     new_states, rewards, done = env.step(actions)
     
     # Update environment
-    env.sim.update_links()
+    if Config.COMMS_ENABLED:
+        env.sim.update_links()
     drone_positions = [uav.pos for uav in env.uavs]
     for zone in env.disaster_zones:
         zone.update_coverage(drone_positions)
