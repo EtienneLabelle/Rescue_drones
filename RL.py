@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import torch
 import torch.nn as nn
@@ -396,41 +397,35 @@ class A2CAgent(BaseRLAgent):
         self.actor_optimizer.load_state_dict(checkpoint['actor_optimizer_state_dict'])
         self.critic_optimizer.load_state_dict(checkpoint['critic_optimizer_state_dict'])
 
-class MADDPGActor(nn.Module):
+class DDPGActor(nn.Module):
     def __init__(self, state_dim, action_dim, hidden_dim=128):
         super().__init__()
         self.fc1 = nn.Linear(state_dim, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
-        self.fc3 = nn.Linear(hidden_dim, action_dim)
-        
-        # Initialize weights and biases properly
-        torch.nn.init.xavier_uniform_(self.fc1.weight)
-        torch.nn.init.zeros_(self.fc1.bias)
-        torch.nn.init.xavier_uniform_(self.fc2.weight)
-        torch.nn.init.zeros_(self.fc2.bias)
-        torch.nn.init.xavier_uniform_(self.fc3.weight)
-        torch.nn.init.zeros_(self.fc3.bias)  # Zero bias for output layer
-        
+        self.fc3 = nn.Linear(hidden_dim, hidden_dim)
+        self.fc4 = nn.Linear(hidden_dim, action_dim)
+
+        for layer in (self.fc1, self.fc2, self.fc3, self.fc4):
+            torch.nn.init.xavier_uniform_(layer.weight)
+            torch.nn.init.zeros_(layer.bias)
+
     def forward(self, x):
         x = torch.relu(self.fc1(x))
         x = torch.relu(self.fc2(x))
-        return torch.tanh(self.fc3(x))  # Continuous actions in [-1, 1]
+        x = torch.relu(self.fc3(x))
+        return torch.tanh(self.fc4(x))  # Continuous actions in [-1, 1]
 
-class MADDPGCritic(nn.Module):
-    def __init__(self, total_state_dim, total_action_dim, hidden_dim=128):
+class DDPGCritic(nn.Module):
+    def __init__(self, total_state_dim, total_action_dim, hidden_dim=256):
         super().__init__()
         self.fc1 = nn.Linear(total_state_dim + total_action_dim, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
         self.fc3 = nn.Linear(hidden_dim, 1)
-        
-        # Initialize weights properly
-        torch.nn.init.xavier_uniform_(self.fc1.weight)
-        torch.nn.init.zeros_(self.fc1.bias)
-        torch.nn.init.xavier_uniform_(self.fc2.weight)
-        torch.nn.init.zeros_(self.fc2.bias)
-        torch.nn.init.xavier_uniform_(self.fc3.weight)
-        torch.nn.init.zeros_(self.fc3.bias)
-        
+
+        for layer in (self.fc1, self.fc2, self.fc3):
+            torch.nn.init.xavier_uniform_(layer.weight)
+            torch.nn.init.zeros_(layer.bias)
+
     def forward(self, states, actions):
         x = torch.cat([states, actions], dim=1)
         x = torch.relu(self.fc1(x))
@@ -466,210 +461,328 @@ class CentralizedReplayBuffer:
     def __len__(self):
         return len(self.buffer)
 
-class MADDPGAgent(BaseRLAgent):
-    def __init__(self, agent_id, state_dim, action_dim, num_agents,
-                 learning_rate=0.001, gamma=0.99, tau=0.01, shared_buffer=None):
+class PrivateReplayBuffer:
+    """Per-agent replay buffer — each UAV stores only its own experience."""
+    def __init__(self, max_size=100000):
+        self.buffer = deque(maxlen=max_size)
+
+    def push(self, state, action, reward, next_state, done):
+        self.buffer.append((state, action, reward, next_state, done))
+
+    def sample(self, batch_size):
+        if len(self.buffer) < batch_size:
+            return None
+        batch = random.sample(self.buffer, batch_size)
+        states, actions, rewards, next_states, dones = zip(*batch)
+        return (
+            torch.FloatTensor(np.array(states)),
+            torch.FloatTensor(np.array(actions)),
+            torch.FloatTensor(np.array(rewards)),
+            torch.FloatTensor(np.array(next_states)),
+            torch.BoolTensor(np.array(dones)),
+        )
+
+    def __len__(self):
+        return len(self.buffer)
+
+
+def collect_step(agents: dict, prev_states: dict, actions: dict,
+                 rewards: dict, next_states: dict, done: bool):
+    """Push one environment step of experience into each agent's buffer.
+
+    Distributed mode: each agent receives its own (s, a, r, s').
+    Centralized mode: builds joint vectors and pushes once to the shared buffer
+                      (all agents reference the same CentralizedReplayBuffer).
+    """
+    first = next(iter(agents.values()))
+
+    if first.distributed:
+        for aid, agent in agents.items():
+            if aid in prev_states and aid in next_states:
+                agent.remember(
+                    np.array(prev_states[aid]),
+                    np.array(actions.get(aid, [0] * agent.action_dim)),
+                    rewards.get(aid, 0.0),
+                    np.array(next_states[aid]),
+                    done,
+                )
+    else:
+        joint_state, joint_action = [], []
+        joint_reward, joint_next_state, joint_done = [], [], []
+        for aid in sorted(agents.keys()):
+            agent = agents[aid]
+            if aid in prev_states and aid in next_states:
+                joint_state.extend(prev_states[aid])
+                joint_action.extend(actions.get(aid, [0] * agent.action_dim))
+                joint_reward.append(rewards.get(aid, 0.0))
+                joint_next_state.extend(next_states[aid])
+            else:
+                joint_state.extend([0] * agent.state_dim)
+                joint_action.extend([0] * agent.action_dim)
+                joint_reward.append(0.0)
+                joint_next_state.extend([0] * agent.state_dim)
+            joint_done.append(done)
+        first.remember(
+            np.array(joint_state),  np.array(joint_action),
+            np.array(joint_reward), np.array(joint_next_state),
+            np.array(joint_done),
+        )
+
+
+class DDPGAgent(BaseRLAgent):
+    """Base DDPG agent: actor + target actor, select_action, soft_update, save/load.
+
+    Subclasses supply the critic, replay buffer, remember(), and update().
+    """
+
+    # Set by each subclass so collect_step can branch without isinstance checks.
+    distributed: bool
+    shared_buffer = None
+
+    def __init__(self, agent_id, state_dim, action_dim,
+                 learning_rate=0.001, actor_lr=None, critic_lr=None,
+                 gamma=0.99, tau=0.01):
         super().__init__(state_dim, action_dim, learning_rate)
-        
         self.agent_id = agent_id
-        self.num_agents = num_agents
-        
-        # Compute dimensions dynamically
-        self.total_state_dim = state_dim * num_agents
-        self.total_action_dim = action_dim * num_agents
-        
-        self.gamma = gamma
-        self.tau = tau
-        
-        # Device handling
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        
-        # Shared centralized replay buffer
-        self.shared_buffer = shared_buffer
-        
-        # Networks - CORRECT: One target actor/critic per agent
-        self.actor = MADDPGActor(state_dim, action_dim).to(self.device)
-        self.critic = MADDPGCritic(self.total_state_dim, self.total_action_dim).to(self.device)
-        self.target_actor = MADDPGActor(state_dim, action_dim).to(self.device)
-        self.target_critic = MADDPGCritic(self.total_state_dim, self.total_action_dim).to(self.device)
-        
-        # Optimizers
-        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=learning_rate)
-        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=learning_rate)
-        
-        # Initialize target networks
+        self.gamma    = gamma
+        self.tau      = tau
+        self.device   = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        _actor_lr = actor_lr if actor_lr is not None else learning_rate
+        self._critic_lr = critic_lr if critic_lr is not None else learning_rate
+
+        self.actor        = DDPGActor(state_dim, action_dim).to(self.device)
+        self.target_actor = DDPGActor(state_dim, action_dim).to(self.device)
+        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=_actor_lr)
         self.soft_update(self.actor, self.target_actor, tau=1.0)
-        self.soft_update(self.critic, self.target_critic, tau=1.0)
-    
+
     def soft_update(self, source, target, tau):
-        """Soft update target network"""
         for target_param, param in zip(target.parameters(), source.parameters()):
             target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
-    
-    def remember(self, joint_state, joint_action, joint_reward, joint_next_state, joint_done):
-        """Store experience in shared buffer - called by environment"""
-        if self.shared_buffer is not None:
-            self.shared_buffer.push(joint_state, joint_action, joint_reward, joint_next_state, joint_done)
-    
+
     def select_action(self, state, explore=False, noise_scale=0.0):
-        state = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+        state  = torch.FloatTensor(state).unsqueeze(0).to(self.device)
         action = self.actor(state).squeeze(0).detach().cpu().numpy()
-        
-        # CORRECT: Add noise only if exploring
         if explore and noise_scale > 0:
-            noise = np.random.normal(0, noise_scale, action.shape)
-            action = np.clip(action + noise, -1, 1)
-        
+            action = np.clip(action + np.random.normal(0, noise_scale, action.shape), -1, 1)
         return action
-    
-    def update(self, batch_size=32, all_target_actors=None, return_losses=False):
-        """Update using centralized replay buffer with proper target coordination"""
-        if self.shared_buffer is None or len(self.shared_buffer) < batch_size:
-            return None if return_losses else None
-        
-        # Sample from shared buffer
-        batch = self.shared_buffer.sample(batch_size)
+
+    def save_model(self, path):
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        torch.save({
+            self.agent_id: {
+                'actor':            self.actor.state_dict(),
+                'critic':           self.critic.state_dict(),
+                'target_actor':     self.target_actor.state_dict(),
+                'target_critic':    self.target_critic.state_dict(),
+                'actor_optimizer':  self.actor_optimizer.state_dict(),
+                'critic_optimizer': self.critic_optimizer.state_dict(),
+            }
+        }, path)
+
+    def load_model(self, path):
+        raw = torch.load(path, map_location=self.device)
+        states = raw[self.agent_id] if self.agent_id in raw else raw
+        self.actor.load_state_dict(states['actor'])
+        self.critic.load_state_dict(states['critic'])
+        self.target_actor.load_state_dict(states['target_actor'])
+        self.target_critic.load_state_dict(states['target_critic'])
+        if 'actor_optimizer' in states:
+            self.actor_optimizer.load_state_dict(states['actor_optimizer'])
+        if 'critic_optimizer' in states:
+            self.critic_optimizer.load_state_dict(states['critic_optimizer'])
+
+
+class IDDPGAgent(DDPGAgent):
+    """Independent DDPG + gossip FL.
+
+    Each agent trains independently with its own private replay buffer and a
+    local critic (own obs + action only).  Actor weights are periodically
+    synchronised with neighbours via gossip, which is the only coordination
+    mechanism — there is no shared/centralised critic.
+    """
+
+    distributed  = True
+    shared_buffer = None
+
+    def __init__(self, agent_id, state_dim, action_dim,
+                 learning_rate=0.001, actor_lr=None, critic_lr=None,
+                 gamma=0.99, tau=0.01, buffer_size=100000):
+        super().__init__(agent_id, state_dim, action_dim,
+                         learning_rate, actor_lr, critic_lr, gamma, tau)
+        self.private_buffer = PrivateReplayBuffer(max_size=buffer_size)
+        self.critic        = DDPGCritic(state_dim, action_dim).to(self.device)
+        self.target_critic = DDPGCritic(state_dim, action_dim).to(self.device)
+        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=self._critic_lr)
+        self.soft_update(self.critic, self.target_critic, tau=1.0)
+        # kept for model_io / checkpoint compatibility
+        self.total_state_dim  = state_dim
+        self.total_action_dim = action_dim
+
+    def remember(self, state, action, reward, next_state, done):
+        self.private_buffer.push(state, action, reward, next_state, done)
+
+    def update(self, batch_size=32, return_losses=False, **_):
+        if len(self.private_buffer) < batch_size:
+            return None
+        batch = self.private_buffer.sample(batch_size)
         if batch is None:
-            return None if return_losses else None
-        
-        joint_states, joint_actions, joint_rewards, joint_next_states, joint_dones = batch
-        
-        # Move batch to device
-        joint_states = joint_states.to(self.device)
-        joint_actions = joint_actions.to(self.device)
-        joint_rewards = joint_rewards.to(self.device)
-        joint_next_states = joint_next_states.to(self.device)
-        joint_dones = joint_dones.to(self.device)
-        
-        # Extract this agent's data from joint tensors
-        agent_idx = int(self.agent_id.split('_')[1]) - 1  # uav_1 -> 0, uav_2 -> 1, etc.
-        state_dim = self.state_dim
-        action_dim = self.action_dim
-        
-        # Consistent ordering: agent_0, agent_1, agent_2, etc.
-        start_state_idx = agent_idx * state_dim
-        end_state_idx = start_state_idx + state_dim
-        start_action_idx = agent_idx * action_dim
-        end_action_idx = start_action_idx + action_dim
-        
-        # Extract this agent's states and actions
-        states = joint_states[:, start_state_idx:end_state_idx]
-        actions = joint_actions[:, start_action_idx:end_action_idx]
-        
-        # CORRECT: Proper shape handling
-        rewards = joint_rewards[:, agent_idx].unsqueeze(1)  # (B,) -> (B,1)
-        dones = joint_dones[:, agent_idx].float().unsqueeze(1)  # (B,) -> (B,1)
-        
-        next_states = joint_next_states[:, start_state_idx:end_state_idx]
-        
-        # Critic update
-        current_q_values = self.critic(joint_states, joint_actions)  # Shape: (B,1)
-        
+            return None
+
+        states, actions, rewards, next_states, dones = batch
+        states      = states.to(self.device)
+        actions     = actions.to(self.device)
+        rewards     = rewards.to(self.device).unsqueeze(1)
+        next_states = next_states.to(self.device)
+        dones       = dones.float().to(self.device).unsqueeze(1)
+
         with torch.no_grad():
-            # CORRECT: Use provided target actors from trainer loop
-            if all_target_actors is None:
-                # Fallback to local targets if not provided
-                all_target_actors = [self.target_actor] * self.num_agents
-            
-            next_actions = []
-            for i in range(self.num_agents):
-                start_idx = i * state_dim
-                end_idx = start_idx + state_dim
-                agent_next_states = joint_next_states[:, start_idx:end_idx]
-                
-                a_i = all_target_actors[i](agent_next_states)
-                next_actions.append(a_i)
-            
-            # Concatenate all next actions in consistent order
-            next_joint_actions = torch.cat(next_actions, dim=1)
-            
-            # Use this agent's target critic
-            next_q_values = self.target_critic(joint_next_states, next_joint_actions)  # Shape: (B,1)
-            
-            # CORRECT: Proper target computation with matching shapes
-            target_q_values = rewards + (self.gamma * next_q_values * (1.0 - dones))
-        
-        # Critic loss
-        critic_loss = nn.MSELoss()(current_q_values, target_q_values)
-        
+            target_q = rewards + self.gamma * (1.0 - dones) * \
+                       self.target_critic(next_states, self.target_actor(next_states))
+        critic_loss = nn.MSELoss()(self.critic(states, actions), target_q)
         self.critic_optimizer.zero_grad()
         critic_loss.backward()
-        # CORRECT: Grad clipping for critic
         torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 0.5)
         self.critic_optimizer.step()
-        
-        # Actor update
+
+        actor_loss = -self.critic(states, self.actor(states)).mean()
         self.actor_optimizer.zero_grad()
-        
-        # Compute new actions for this agent
-        new_actions = self.actor(states)
-        
-        # Create joint actions with new action for this agent, old actions for others
-        new_joint_actions = joint_actions.clone()
-        new_joint_actions[:, start_action_idx:end_action_idx] = new_actions
-        
-        # Compute actor loss
-        actor_q_values = self.critic(joint_states, new_joint_actions)
-        actor_loss = -actor_q_values.mean()
-        
         actor_loss.backward()
-        # CORRECT: Grad clipping for actor
         torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 0.5)
         self.actor_optimizer.step()
-        
-        # Soft update target networks (standard MADDPG: every update step)
-        self.soft_update(self.actor, self.target_actor, self.tau)
-        self.soft_update(self.critic, self.target_critic, self.tau)
 
-        if return_losses:
-            return float(critic_loss.item())
-        return None
-    
-    def save_model(self, path):
-        torch.save({
-            'actor_state_dict': self.actor.state_dict(),
-            'critic_state_dict': self.critic.state_dict(),
-            'target_actor_state_dict': self.target_actor.state_dict(),
-            'target_critic_state_dict': self.target_critic.state_dict(),
-            'actor_optimizer_state_dict': self.actor_optimizer.state_dict(),
-            'critic_optimizer_state_dict': self.critic_optimizer.state_dict(),
-            'agent_id': self.agent_id
-        }, path)
-    
-    def load_model(self, path):
-        checkpoint = torch.load(path)
-        self.actor.load_state_dict(checkpoint['actor_state_dict'])
-        self.critic.load_state_dict(checkpoint['critic_state_dict'])
-        self.target_actor.load_state_dict(checkpoint['target_actor_state_dict'])
-        self.target_critic.load_state_dict(checkpoint['target_critic_state_dict'])
-        self.actor_optimizer.load_state_dict(checkpoint['actor_optimizer_state_dict'])
-        self.critic_optimizer.load_state_dict(checkpoint['critic_optimizer_state_dict'])
-        self.agent_id = checkpoint['agent_id']
+        self.soft_update(self.actor,  self.target_actor,  self.tau)
+        self.soft_update(self.critic, self.target_critic, self.tau)
+        return float(critic_loss.item()) if return_losses else None
 
     def reset_critic(self):
-        """Reset critic network to fix backwards learning"""
-        self.critic = MADDPGCritic(self.total_state_dim, self.total_action_dim).to(self.device)
-        self.target_critic = MADDPGCritic(self.total_state_dim, self.total_action_dim).to(self.device)
-        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=self.learning_rate)
-        self.soft_update(self.critic, self.target_critic, tau=1.0)  # Copy weights immediately
+        self.critic        = DDPGCritic(self.state_dim, self.action_dim).to(self.device)
+        self.target_critic = DDPGCritic(self.state_dim, self.action_dim).to(self.device)
+        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=self._critic_lr)
+        self.soft_update(self.critic, self.target_critic, tau=1.0)
+
+
+class MADDPGAgent(DDPGAgent):
+    """Multi-Agent DDPG with centralised critic.
+
+    All agents share a single CentralizedReplayBuffer.  Each agent's critic
+    receives the full joint observation and joint action vectors, giving it
+    global visibility during training while the actor remains decentralised.
+    """
+
+    distributed = False
+
+    def __init__(self, agent_id, state_dim, action_dim, num_agents,
+                 learning_rate=0.001, actor_lr=None, critic_lr=None,
+                 gamma=0.99, tau=0.01, shared_buffer=None):
+        super().__init__(agent_id, state_dim, action_dim,
+                         learning_rate, actor_lr, critic_lr, gamma, tau)
+        self.num_agents    = num_agents
+        self.shared_buffer = shared_buffer
+        self.private_buffer = None
+
+        critic_state_dim  = state_dim  * num_agents
+        critic_action_dim = action_dim * num_agents
+        self.total_state_dim  = critic_state_dim
+        self.total_action_dim = critic_action_dim
+
+        self.critic        = DDPGCritic(critic_state_dim, critic_action_dim).to(self.device)
+        self.target_critic = DDPGCritic(critic_state_dim, critic_action_dim).to(self.device)
+        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=self._critic_lr)
+        self.soft_update(self.critic, self.target_critic, tau=1.0)
+
+    def remember(self, joint_state, joint_action, reward, joint_next_state, done):
+        if self.shared_buffer is not None:
+            self.shared_buffer.push(joint_state, joint_action, reward, joint_next_state, done)
+
+    def update(self, batch_size=32, all_target_actors=None, return_losses=False):
+        if self.shared_buffer is None or len(self.shared_buffer) < batch_size:
+            return None
+        batch = self.shared_buffer.sample(batch_size)
+        if batch is None:
+            return None
+
+        joint_states, joint_actions, joint_rewards, joint_next_states, joint_dones = batch
+        joint_states      = joint_states.to(self.device)
+        joint_actions     = joint_actions.to(self.device)
+        joint_rewards     = joint_rewards.to(self.device)
+        joint_next_states = joint_next_states.to(self.device)
+        joint_dones       = joint_dones.to(self.device)
+
+        agent_idx        = int(self.agent_id.split('_')[1]) - 1
+        sd, ad           = self.state_dim, self.action_dim
+        s0, s1           = agent_idx * sd,  agent_idx * sd  + sd
+        a0, a1           = agent_idx * ad,  agent_idx * ad  + ad
+
+        states  = joint_states[:, s0:s1]
+        rewards = joint_rewards[:, agent_idx].unsqueeze(1)
+        dones   = joint_dones[:, agent_idx].float().unsqueeze(1)
+
+        with torch.no_grad():
+            if all_target_actors is None:
+                all_target_actors = [self.target_actor] * self.num_agents
+            next_acts = torch.cat([
+                all_target_actors[i](joint_next_states[:, i*sd:(i+1)*sd])
+                for i in range(self.num_agents)
+            ], dim=1)
+            target_q = rewards + self.gamma * (1.0 - dones) * \
+                       self.target_critic(joint_next_states, next_acts)
+
+        critic_loss = nn.MSELoss()(self.critic(joint_states, joint_actions), target_q)
+        self.critic_optimizer.zero_grad()
+        critic_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 0.5)
+        self.critic_optimizer.step()
+
+        new_joint_actions = joint_actions.clone()
+        new_joint_actions[:, a0:a1] = self.actor(states)
+        actor_loss = -self.critic(joint_states, new_joint_actions).mean()
+        self.actor_optimizer.zero_grad()
+        actor_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 0.5)
+        self.actor_optimizer.step()
+
+        self.soft_update(self.actor,  self.target_actor,  self.tau)
+        self.soft_update(self.critic, self.target_critic, self.tau)
+        return float(critic_loss.item()) if return_losses else None
+
+    def reset_critic(self):
+        self.critic        = DDPGCritic(self.total_state_dim, self.total_action_dim).to(self.device)
+        self.target_critic = DDPGCritic(self.total_state_dim, self.total_action_dim).to(self.device)
+        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=self._critic_lr)
+        self.soft_update(self.critic, self.target_critic, tau=1.0)
 
 # Factory function
 def create_rl_agent(agent_type, state_dim, action_dim, **kwargs):
-    """Factory function to create RL agents"""
-    agents = {
-        'dqn': DQNAgent,
-        'ppo': PPOAgent,
-        'a2c': A2CAgent,
-        'maddpg': MADDPGAgent
+    """Factory function to create RL agents.
+
+    agent_type options:
+        'dqn'    — DQNAgent
+        'ppo'    — PPOAgent
+        'a2c'    — A2CAgent
+        'iddpg'  — IDDPGAgent  (independent DDPG + gossip FL; requires agent_id)
+        'maddpg' — MADDPGAgent (centralised critic; requires agent_id, num_agents)
+    """
+    registry = {
+        'dqn':    DQNAgent,
+        'ppo':    PPOAgent,
+        'a2c':    A2CAgent,
+        'iddpg':  IDDPGAgent,
+        'maddpg': MADDPGAgent,
     }
-    
-    if agent_type not in agents:
-        raise ValueError(f"Unknown agent type: {agent_type}. Available: {list(agents.keys())}")
-    
-    # Handle MADDPG special case
+
+    if agent_type not in registry:
+        raise ValueError(f"Unknown agent type: {agent_type!r}. Available: {list(registry)}")
+
+    if agent_type == 'iddpg':
+        if 'agent_id' not in kwargs:
+            raise ValueError("IDDPGAgent requires 'agent_id'")
+        return IDDPGAgent(kwargs.pop('agent_id'), state_dim, action_dim, **kwargs)
+
     if agent_type == 'maddpg':
         if 'agent_id' not in kwargs or 'num_agents' not in kwargs:
-            raise ValueError("MADDPG requires 'agent_id' and 'num_agents' parameters")
-        return agents[agent_type](kwargs['agent_id'], state_dim, action_dim, kwargs['num_agents'], **kwargs)
-    
-    return agents[agent_type](state_dim, action_dim, **kwargs)
+            raise ValueError("MADDPGAgent requires 'agent_id' and 'num_agents'")
+        return MADDPGAgent(kwargs.pop('agent_id'), state_dim, action_dim,
+                           kwargs.pop('num_agents'), **kwargs)
+
+    return registry[agent_type](state_dim, action_dim, **kwargs)

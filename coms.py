@@ -13,6 +13,11 @@ C = 3e8  # meters/second
 WAVELENGHT = C / FREQUENCY
 
 
+def fspl_db(distance, frequency):
+    """Free-space path loss (dB)."""
+    return 20 * math.log10(max(distance, 1.0)) + 20 * math.log10(frequency) - 147.55
+
+
 class Link:
     def __init__(self, drone1, drone2, bandwidth, frequency, noise_power_dBm,
                  enable_delay=False, base_latency_ms=5.0, jitter_ms=2.0,
@@ -45,8 +50,7 @@ class Link:
         return distance
 
     def calculate_fspl(self):
-        fspl = 20 * math.log10(self.distance) + 20 * math.log10(self.frequency) - 147.55
-        return fspl
+        return fspl_db(self.distance, self.frequency)
 
     def calculate_sinr(self):
         fspl = self.calculate_fspl()
@@ -154,20 +158,37 @@ def calculate_noise_power(bandwidth):
     return noise_power_dBm
 
 def calculate_interference_power(interference_sources):
+    """Total interference power (dBm) from a list of received powers (dBm)."""
+    interference_powers = [10 ** (p / 10) for p in interference_sources]
+    return 10 * np.log10(sum(interference_powers))
+
+
+# ---------------------------------------------------------------------------
+# SNR / SINR primitives — all dBm↔linear conversions go through here
+# ---------------------------------------------------------------------------
+
+def dBm_to_linear(power_dBm):
+    return 10 ** (power_dBm / 10)
+
+def linear_to_dBm(power_linear):
+    return 10 * math.log10(max(power_linear, 1e-30))
+
+def compute_snr_linear(transmit_power_dBm, path_loss_dB, noise_power_dBm):
+    """SNR as a linear ratio (no interference)."""
+    return dBm_to_linear(transmit_power_dBm - path_loss_dB - noise_power_dBm)
+
+def compute_sinr_linear(transmit_power_dBm, path_loss_dB, noise_power_dBm,
+                        interferers_received_dBm):
+    """SINR as a linear ratio.
+
+    interferers_received_dBm: list of received powers (dBm) at the user from each
+                              interfering UAV, i.e. P_tx - PathLoss(interferer→user).
     """
-    Calculate the total interference power from nearby sources (in dBm).
-    interference_sources: A list of powers (in dBm) from different interference sources.
-    """
-    # Convert interference sources from dBm to linear scale (watts)
-    interference_powers = [10 ** (interference / 10) for interference in interference_sources]
-    
-    # Sum all interference powers (in linear scale) and convert back to dBm
-    total_interference_power_watts = sum(interference_powers)
-    
-    # Convert total interference power back to dBm
-    total_interference_power_dBm = 10 * np.log10(total_interference_power_watts)
-    
-    return total_interference_power_dBm
+    signal = dBm_to_linear(transmit_power_dBm - path_loss_dB)
+    noise  = dBm_to_linear(noise_power_dBm)
+    inter  = dBm_to_linear(calculate_interference_power(interferers_received_dBm)) \
+             if interferers_received_dBm else 0.0
+    return signal / (noise + inter)
 
 def rayleigh_fading():
     """
@@ -243,6 +264,83 @@ def calculate_sinr_with_fading(positions,fading_type='rician', interference_sour
 def calculate_shannon_capacity(bandwidth, linear_snr):
     # Shannon capacity formula
     return bandwidth * math.log2(1 + linear_snr)
+
+
+# ---------------------------------------------------------------------------
+# Air-to-ground probabilistic LoS model (Al-Hourani et al., 2014)
+# ---------------------------------------------------------------------------
+
+_ATG_ENV_PARAMS = {
+    'urban':       (9.61,  0.16),
+    'suburban':    (4.88,  0.43),
+    'dense_urban': (12.08, 0.11),
+    'rural':       (0.01,  0.23),
+}
+
+def prob_los(d_2d, h_uav, environment='urban'):
+    """Probability of LoS for an air-to-ground link."""
+    a, b = _ATG_ENV_PARAMS.get(environment, _ATG_ENV_PARAMS['urban'])
+    theta = np.degrees(np.arctan2(h_uav, max(d_2d, 1e-6)))
+    return 1.0 / (1.0 + a * np.exp(-b * (theta - a)))
+
+
+def air_to_ground_path_loss(d_2d, h_uav, frequency, environment='urban',
+                             eta_los=1.0, eta_nlos=20.0):
+    """Mean air-to-ground path loss (dB) with probabilistic LoS.
+
+    eta_los / eta_nlos: excess attenuation (dB) for LoS / NLoS conditions.
+    """
+    d_3d = math.sqrt(d_2d ** 2 + h_uav ** 2)
+    p = prob_los(d_2d, h_uav, environment)
+    fspl = fspl_db(d_3d, frequency)
+    return p * (fspl + eta_los) + (1 - p) * (fspl + eta_nlos)
+
+
+def uav_to_user_rate(d_2d, h_uav, frequency, bandwidth,
+                     transmit_power_dBm=30, noise_power_dBm=-90,
+                     interferers_received_dBm=None,
+                     environment='urban'):
+    """Shannon rate (bps) for one UAV-to-ground-user link.
+
+    bandwidth should already be the per-user share (B_users / users_per_uav).
+    Pass interferers_received_dBm (list of P_tx - PathLoss per interferer) for
+    SINR-based rate; omit for SNR-only (interference-free upper bound).
+    """
+    pl = air_to_ground_path_loss(d_2d, h_uav, frequency, environment)
+    if interferers_received_dBm:
+        ratio = compute_sinr_linear(transmit_power_dBm, pl, noise_power_dBm,
+                                    interferers_received_dBm)
+    else:
+        ratio = compute_snr_linear(transmit_power_dBm, pl, noise_power_dBm)
+    return calculate_shannon_capacity(bandwidth, ratio)
+
+
+def compute_global_sum_rate_mbps(uavs, assignment, config):
+    """Global SINR-based sum rate (Mbps) across all served users.
+
+    assignment: dict {uav.id: [GroundUser, ...]}
+    """
+    bw_per_uav = getattr(config, 'BANDWIDTH_PER_UAV', 1e6)
+    h_uav      = getattr(config, 'UAV_HEIGHT', 100.0)
+    total = 0.0
+    for uav in uavs:
+        users = assignment.get(uav.id, [])
+        if not users:
+            continue
+        bw = bw_per_uav / len(users)
+        for user in users:
+            d = math.sqrt((user.pos[0] - uav.pos[0]) ** 2 + (user.pos[1] - uav.pos[1]) ** 2)
+            interferers_dBm = [
+                config.TRANSMIT_POWER - air_to_ground_path_loss(
+                    math.sqrt((user.pos[0] - o.pos[0]) ** 2 + (user.pos[1] - o.pos[1]) ** 2),
+                    h_uav, config.FREQUENCY
+                )
+                for o in uavs if o.id != uav.id
+            ]
+            total += uav_to_user_rate(d, h_uav, config.FREQUENCY, bw,
+                                      config.TRANSMIT_POWER, config.NOISE_POWER,
+                                      interferers_received_dBm=interferers_dBm)
+    return total / 1e6
 
 def calculate_end_to_end_path_loss(positions):
     """

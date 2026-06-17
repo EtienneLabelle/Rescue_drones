@@ -1,7 +1,10 @@
 # env.py       
 import random
 import numpy as np
-from coms import Link
+from coms import (Link, prob_los, air_to_ground_path_loss, uav_to_user_rate,
+                  calculate_shannon_capacity, compute_global_sum_rate_mbps,
+                  compute_snr_linear, compute_sinr_linear, linear_to_dBm)
+from utils import calculate_distance
 from drones import Drone
 from config import Config
 import torch
@@ -46,8 +49,8 @@ class Simulation:
         self.obstacles = []  
         
         for i in range(number_of_obstacles):
-            center_x = random.randint(5, 19000) # will need to change this at some point
-            center_y = random.randint(5, 19000)        
+            center_x = random.randint(5, Config.ENV_WIDTH - 5)
+            center_y = random.randint(5, Config.ENV_HEIGHT - 5)
             obstacle = Obstacle(center_position=(center_x, center_y))
             obstacle.calculate_edges(size)
             self.obstacles.append(obstacle)
@@ -65,6 +68,22 @@ class Obstacle:  #self.shape? tj ligne en ce moment
         self.edges_pos = [(x, y) for y in range(start_y, end_y + 1)]
         # return self.edges_pos
 
+class GroundUser:
+    """A person on the ground that UAVs may need to locate or serve."""
+
+    def __init__(self, id, position, mobile=False):
+        self.id = id
+        self.pos = list(position)
+        self.mobile = mobile
+
+    def update(self):
+        """Advance the user's position by one step. Only called when mobile=True."""
+        if not self.mobile:
+            return
+        # Movement logic to be defined
+        pass
+
+
 class DisasterZone:
     """Represents a disaster zone that needs coverage"""
     def __init__(self, center, radius, severity=1.0):
@@ -75,17 +94,11 @@ class DisasterZone:
         
     def update_coverage(self, drone_positions):
         """Update coverage based on drone positions"""
-        total_coverage = 0.0
-        for drone_pos in drone_positions:
-            distance = np.sqrt((drone_pos[0] - self.center[0])**2 + 
-                             (drone_pos[1] - self.center[1])**2)
-            if distance <= self.radius:
-                # Coverage decreases with distance
-                coverage = max(0, 1 - distance / self.radius)
-                total_coverage += coverage  # Use cumulative coverage instead of max
-        
-        # Cap coverage at 1.0 (100% coverage)
-        self.coverage_status = min(1.0, total_coverage)
+        covered = any(
+            np.sqrt((dp[0] - self.center[0])**2 + (dp[1] - self.center[1])**2) <= self.radius
+            for dp in drone_positions
+        )
+        self.coverage_status = 1.0 if covered else 0.0
         return self.coverage_status
 
 class DisasterCoverageEnvironment:
@@ -93,7 +106,7 @@ class DisasterCoverageEnvironment:
     
     def __init__(self, config):
         self.config = config
-        self.sim = Simulation(config.BANDWIDTH, config.FREQUENCY, config.NOISE_POWER)
+        self.sim = Simulation(config.BANDWIDTH_PER_UAV, config.FREQUENCY, config.NOISE_POWER)
         
         # Create disaster zones (random for training)
         self.disaster_zones = self._create_disaster_zones(deterministic=False)
@@ -101,37 +114,21 @@ class DisasterCoverageEnvironment:
         # Initialize UAVs
         self.uavs = []
         self._initialize_uavs()
-        
+
+        # Initialize ground users
+        self.ground_users = []
+        self._initialize_ground_users()
+
         # Coverage tracking
         self.total_coverage = 0.0
         self.episode_steps = 0
         self.max_steps = config.EPISODE_LENGTH
+        self.current_assignment = {uav.id: [] for uav in self.uavs}
         
         # Communication links between UAVs
         self.sim.drones = self.uavs
         self.sim.create_links()
         
-        # Reward normalization infrastructure - PER-AGENT stats
-        self.reward_stats = {}  # Dict keyed by uav.id for per-agent stats
-        self.normalize_rewards = getattr(config, 'NORMALIZE_REWARDS', True)
-        self.norm_warmup = getattr(config, 'NORM_WARMUP', 10)
-        self.norm_clip = getattr(config, 'NORM_CLIP', 3.0)
-        self.ema_beta = getattr(config, 'NORM_EMA_BETA', 0.99)  # EMA decay factor
-        
-        # Initialize per-agent stats
-        self._init_per_agent_stats()
-    
-    def _init_per_agent_stats(self):
-        """Initialize reward statistics for each UAV agent"""
-        for uav in self.uavs:
-            self.reward_stats[uav.id] = {
-                'count': 0,
-                'mean': 0.0,
-                'std': 1.0,
-                'ema_mean': 0.0,
-                'ema_var': 1.0,
-                'm2': 0.0  # For Welford's algorithm
-            }
     
     def _create_disaster_zones(self, deterministic=False, seed=None):
         """Create disaster zones in the environment
@@ -150,24 +147,25 @@ class DisasterCoverageEnvironment:
             
             # Fixed grid-based approach for evaluation
             grid_size = int(np.ceil(np.sqrt(num_uavs)))
-            spacing = 20000 // (grid_size + 1)
-            
+            spacing = self.config.ENV_WIDTH // (grid_size + 1)
+
             zone_configs = []
             for i in range(num_uavs):
                 row = i // grid_size
                 col = i % grid_size
                 x = spacing * (col + 1)
                 y = spacing * (row + 1)
-                radius = 800 + (i % 3) * 200
-                severity = 0.6 + (i % 4) * 0.1
-                zone_configs.append(((x, y), radius, severity))
+                radius = int(0.04 * self.config.ENV_WIDTH)
+                zone_configs.append(((x, y), radius, 1.0))
         else:
             # Random zones for training
             zone_configs = []
             for i in range(num_uavs):
-                x = np.random.uniform(1000, 19000)
-                y = np.random.uniform(1000, 19000)
-                radius = np.random.uniform(600, 1200)
+                margin = getattr(self.config, 'SPAWN_MARGIN', 100)
+                x = np.random.uniform(margin, self.config.ENV_WIDTH  - margin)
+                y = np.random.uniform(margin, self.config.ENV_HEIGHT - margin)
+                radius = np.random.uniform(0.03 * self.config.ENV_WIDTH,
+                                           0.06 * self.config.ENV_WIDTH)
                 severity = np.random.uniform(0.5, 1.0)
                 zone_configs.append(((x, y), radius, severity))
         
@@ -178,89 +176,160 @@ class DisasterCoverageEnvironment:
         return zones
     
     def _initialize_uavs(self):
-        """Initialize UAVs at random positions within bounds"""
+        """Initialize UAVs. Position mode set by config.UAV_INIT_POSITIONS:
+          'random' (default) — uniform random spawn used by RL training.
+          'grid'             — uniform grid used by the FL simulation.
+        """
         num_uavs = getattr(self.config, 'NUM_UAVS', 3)
-        
-        # Generate random spawn positions
-        start_positions = []
-        for _ in range(num_uavs):
-            x = np.random.uniform(1000, 19000)
-            y = np.random.uniform(1000, 19000)
-            start_positions.append([x, y])
-        
+        mode = getattr(self.config, 'UAV_INIT_POSITIONS', 'random')
+
+        if mode == 'grid':
+            cols = int(np.ceil(np.sqrt(num_uavs)))
+            rows = int(np.ceil(num_uavs / cols))
+            sx = self.config.ENV_WIDTH  / (cols + 1)
+            sy = self.config.ENV_HEIGHT / (rows + 1)
+            start_positions = [
+                [sx * (i % cols + 1), sy * (i // cols + 1)]
+                for i in range(num_uavs)
+            ]
+        else:
+            start_positions = [
+                [np.random.uniform(getattr(self.config, 'SPAWN_MARGIN', 100),
+                                   self.config.ENV_WIDTH  - getattr(self.config, 'SPAWN_MARGIN', 100)),
+                 np.random.uniform(getattr(self.config, 'SPAWN_MARGIN', 100),
+                                   self.config.ENV_HEIGHT - getattr(self.config, 'SPAWN_MARGIN', 100))]
+                for _ in range(num_uavs)
+            ]
+
         for i, pos in enumerate(start_positions):
             uav = Drone(id=f"uav_{i+1}", position=pos.copy())
             uav.battery_level = 100.0
             self.uavs.append(uav)
     
-    def get_state(self, uav_id):
-        """Get state representation for a specific UAV"""
-        uav = None
-        for u in self.uavs:
-            if u.id == uav_id:
-                uav = u
-                break
-        
+    def _uniform_pos_in_zone(self, zone):
+        """Uniform random point inside a zone disk (kept for coverage/render logic)."""
+        r = zone.radius * np.sqrt(np.random.uniform(0, 1))
+        theta = np.random.uniform(0, 2 * np.pi)
+        x = np.clip(zone.center[0] + r * np.cos(theta), 0, self.config.ENV_WIDTH)
+        y = np.clip(zone.center[1] + r * np.sin(theta), 0, self.config.ENV_HEIGHT)
+        return [x, y]
+
+    def _sample_user_positions(self, num_users):
+        """Return num_users positions respecting GROUND_USERS_DISTRIBUTION.
+
+        'uniform' (default): uniform random inside the boundary margin.
+        'even': users distributed round-robin across a grid of NUM_ZONES cells,
+                then uniform random within each cell — prevents clustering.
+        """
+        margin = getattr(self.config, 'BOUNDARY_MARGIN', 50)
+        dist   = getattr(self.config, 'GROUND_USERS_DISTRIBUTION', 'uniform')
+
+        if dist == 'even':
+            num_zones = getattr(self.config, 'NUM_ZONES', 1)
+            cols   = int(np.ceil(np.sqrt(num_zones)))
+            rows   = int(np.ceil(num_zones / cols))
+            cell_w = (self.config.ENV_WIDTH  - 2 * margin) / cols
+            cell_h = (self.config.ENV_HEIGHT - 2 * margin) / rows
+            positions = []
+            for i in range(num_users):
+                zone = i % num_zones
+                col  = zone % cols
+                row  = zone // cols
+                x = margin + col * cell_w + np.random.uniform(0, cell_w)
+                y = margin + row * cell_h + np.random.uniform(0, cell_h)
+                positions.append([x, y])
+            return positions
+
+        return [
+            [np.random.uniform(margin, self.config.ENV_WIDTH  - margin),
+             np.random.uniform(margin, self.config.ENV_HEIGHT - margin)]
+            for _ in range(num_users)
+        ]
+
+    def _initialize_ground_users(self):
+        """Spawn ground users inside the disaster zones."""
+        num_users = getattr(self.config, 'NUM_GROUND_USERS', 0)
+        mobile = getattr(self.config, 'GROUND_USERS_MOBILE', False)
+        for i, pos in enumerate(self._sample_user_positions(num_users)):
+            user = GroundUser(id=f"user_{i+1}", position=pos, mobile=mobile)
+            self.ground_users.append(user)
+
+    def get_state_RL(self, uav_id):
+        """Get STATE_DIM-dim state for one UAV.
+
+        [own_x, own_y,  dx1,dy1, ..., dx_K,dy_K (UAV neighbors),  avg_rate, n_users, avg_sinr,  dx1,dy1, ..., dx_k,dy_k (nearest users)]
+        Dimensions: 2 + NUM_NEIGHBORS*2 + 3 + NUM_USER_NEIGHBORS*2
+        """
+        uav = next((u for u in self.uavs if u.id == uav_id), None)
         if uav is None:
             return None
-        
+
         state = []
-        
-        # Find nearest disaster zone
-        nearest_zone = None
-        min_dist = float('inf')
-        for zone in self.disaster_zones:
-            dist = np.sqrt((uav.pos[0] - zone.center[0])**2 + 
-                         (uav.pos[1] - zone.center[1])**2)
-            if dist < min_dist:
-                min_dist = dist
-                nearest_zone = zone
-        
-        if nearest_zone:
-            # 1. Relative position to nearest zone (delta_x, delta_y)
-            delta_x = (nearest_zone.center[0] - uav.pos[0]) / 20000.0  # Normalize
-            delta_y = (nearest_zone.center[1] - uav.pos[1]) / 20000.0  # Normalize
-            state.extend([delta_x, delta_y])
-            
-            # 2. Distance to nearest zone
-            state.append(min_dist / 20000.0)  # Normalize
-            
-            # 3. Zone radius and severity
-            state.append(nearest_zone.radius / 20000.0)  # Normalize
-            state.append(nearest_zone.severity)
-            
-            # 4. Coverage status of nearest zone
-            state.append(nearest_zone.coverage_status)
-            
-            # IMPLEMENT FIX 3: Enhanced state representation with explicit directional signals
-            # Add explicit directional guidance (validated in tests)
-            state.append(1.0 if delta_x > 0.01 else -1.0 if delta_x < -0.01 else 0.0)  # X direction signal
-            state.append(1.0 if delta_y > 0.01 else -1.0 if delta_y < -0.01 else 0.0)  # Y direction signal
+
+        # Normalise positions by max traversable distance per episode so that
+        # one action unit (UAV_MAX_STEP metres) maps to 1/EPISODE_LENGTH obs units.
+        pos_scale = self.config.UAV_MAX_STEP * self.config.EPISODE_LENGTH
+
+        state.append(uav.pos[0] / pos_scale)
+        state.append(uav.pos[1] / pos_scale)
+
+        # Relative positions to 4 nearest neighbours (dx, dy) — padded with zeros if fewer
+        n_neighbors = getattr(self.config, 'NUM_NEIGHBORS', 4)
+        others = sorted(
+            [u for u in self.uavs if u.id != uav_id],
+            key=lambda u: calculate_distance(u.pos, uav.pos)
+        )
+        for nb in others[:n_neighbors]:
+            state.append((nb.pos[0] - uav.pos[0]) / pos_scale)
+            state.append((nb.pos[1] - uav.pos[1]) / pos_scale)
+        for _ in range(max(0, n_neighbors - len(others))):
+            state.extend([0.0, 0.0])
+
+        # User-related features from the most recent assignment
+        assigned = self.current_assignment.get(uav_id, [])
+        h_uav = getattr(self.config, 'UAV_HEIGHT', 100.0)
+        n_total = max(len(self.ground_users), 1)
+
+        if assigned:
+            bw_per_user = self.config.BANDWIDTH_PER_UAV / len(assigned)
+            rates, sinrs_dB = [], []
+            for user in assigned:
+                d_2d = calculate_distance(user.pos, uav.pos)
+                pl   = air_to_ground_path_loss(d_2d, h_uav, self.config.FREQUENCY)
+                inter_sources_dBm = [
+                    self.config.TRANSMIT_POWER - air_to_ground_path_loss(
+                        calculate_distance(user.pos, o.pos), h_uav, self.config.FREQUENCY
+                    )
+                    for o in self.uavs if o.id != uav_id
+                ]
+                rates.append(uav_to_user_rate(
+                    d_2d, h_uav, self.config.FREQUENCY, bw_per_user,
+                    self.config.TRANSMIT_POWER, self.config.NOISE_POWER,
+                    interferers_received_dBm=inter_sources_dBm,
+                ))
+                sinrs_dB.append(linear_to_dBm(compute_sinr_linear(
+                    self.config.TRANSMIT_POWER, pl, self.config.NOISE_POWER, inter_sources_dBm
+                )))
+            avg_rate_mbps = np.mean(rates) / 1e6
+            avg_sinr_norm = np.mean(sinrs_dB) / 30.0
         else:
-            # If no zones, use zeros
-            state.extend([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])  # Added 2 more zeros for direction signals
-        
-        # 5. UAV battery level
-        state.append(uav.battery_level / 100.0)  # Normalize to [0,1]
-        
-        # 6. Relative distances to other UAVs
-        for other_uav in self.uavs:
-            if other_uav.id != uav_id:
-                dist = np.sqrt((uav.pos[0] - other_uav.pos[0])**2 + 
-                             (uav.pos[1] - other_uav.pos[1])**2)
-                state.append(dist / 20000.0)  # Normalize
-            else:
-                state.append(0.0)  # Self distance is 0
-        
-        # 7. Communication quality (if applicable)
-        min_capacity = self._get_minimum_link_capacity()
-        state.append(min_capacity)
-        
-        # Pad state to fixed size
-        while len(state) < self.config.STATE_DIM:
-            state.append(0.0)
-        
-        return np.array(state[:self.config.STATE_DIM])
+            avg_rate_mbps = 0.0
+            avg_sinr_norm = 0.0
+
+        state.append(avg_rate_mbps)
+        state.append(len(assigned) / n_total)   # fraction of users served
+        state.append(avg_sinr_norm)
+
+        # Relative positions to k nearest ground users (dx, dy) — padded with zeros if fewer
+        k = getattr(self.config, 'NUM_USER_NEIGHBORS', 3)
+        nearest_users = sorted(self.ground_users, key=lambda u: calculate_distance(u.pos, uav.pos))
+        for u in nearest_users[:k]:
+            state.append((u.pos[0] - uav.pos[0]) / pos_scale)
+            state.append((u.pos[1] - uav.pos[1]) / pos_scale)
+        for _ in range(max(0, k - len(nearest_users))):
+            state.extend([0.0, 0.0])
+
+        return np.array(state, dtype=np.float32)
     
     def _get_minimum_link_capacity(self):
         """Get minimum link capacity in Mbps, representing the bottleneck link"""
@@ -290,8 +359,7 @@ class DisasterCoverageEnvironment:
                 action = actions[uav.id]
                 
                 # Convert continuous action [-1,1] to movement
-                # 200m/step lets a drone cross the 20 000m map in ~100 steps (400-step episodes)
-                max_movement = 200
+                max_movement = getattr(self.config, 'UAV_MAX_STEP', 20)
 
                 movement_x = action[0] * max_movement
                 movement_y = action[1] * max_movement
@@ -309,46 +377,41 @@ class DisasterCoverageEnvironment:
                 # Decrease battery
                 uav.battery_level = max(0, uav.battery_level - 0.1)
         
+        # Update ground users
+        for user in self.ground_users:
+            user.update()
+
         # Update disaster zone coverage
         drone_positions = [uav.pos for uav in self.uavs]
-        total_coverage = 0.0
-        
-        for zone in self.disaster_zones:
-            coverage = zone.update_coverage(drone_positions)
-            total_coverage += coverage * zone.severity
-        
-        self.total_coverage = total_coverage / len(self.disaster_zones)
+        self.total_coverage = sum(
+            zone.update_coverage(drone_positions) for zone in self.disaster_zones
+        ) / len(self.disaster_zones)
         
         # Update communication links (skipped when COMMS_ENABLED=False for speed)
         if getattr(self.config, 'COMMS_ENABLED', True):
             self.sim.update_links()
         
-        # Calculate rewards
+        # Assign each user to the nearest UAV only if that UAV's SINR >= SINR_MIN_DB
+        uav_assignment = {uav.id: [] for uav in self.uavs}
+        h_uav      = getattr(self.config, 'UAV_HEIGHT', 100.0)
+        sinr_min   = getattr(self.config, 'SINR_MIN_DB', 5.0)
+        for user in self.ground_users:
+            dists    = [calculate_distance(user.pos, u.pos) for u in self.uavs]
+            best_i   = int(np.argmin(dists))
+            best_uav = self.uavs[best_i]
+            pl_best  = air_to_ground_path_loss(dists[best_i], h_uav, self.config.FREQUENCY)
+            inter_dBm = [
+                self.config.TRANSMIT_POWER - air_to_ground_path_loss(dists[j], h_uav, self.config.FREQUENCY)
+                for j in range(len(self.uavs)) if j != best_i
+            ]
+            sinr_dB = linear_to_dBm(compute_sinr_linear(
+                self.config.TRANSMIT_POWER, pl_best, self.config.NOISE_POWER, inter_dBm
+            ))
+            if sinr_dB >= sinr_min:
+                uav_assignment[best_uav.id].append(user)
+        self.current_assignment = uav_assignment
         for uav in self.uavs:
-            # Get movement magnitude for this UAV
-            movement_magnitude = getattr(uav, 'last_movement_magnitude', 0)
-            raw_reward = self._calculate_reward(uav, movement_magnitude)
-            
-            # Always update stats, but only normalize if enabled
-            if self.normalize_rewards:
-                normalized_reward = self._normalize_reward(uav.id, raw_reward)
-                rewards[uav.id] = normalized_reward
-            else:
-                # Just update stats without normalization
-                self._update_reward_stats(uav.id, raw_reward)
-                rewards[uav.id] = raw_reward
-            
-            # Debug: Log reward values (only when verbose logging is enabled)
-            if self.episode_steps % 50 == 0 and getattr(self.config, 'VERBOSE_LOGGING', False):
-                if self.normalize_rewards:
-                    # Use proper logging instead of print for performance
-                    import logging
-                    logger = logging.getLogger(__name__)
-                    logger.debug(f"UAV {uav.id}: Raw={raw_reward:.2f}, Norm={rewards[uav.id]:.2f}, Pos={uav.pos}, Move={movement_magnitude:.2f}")
-                else:
-                    import logging
-                    logger = logging.getLogger(__name__)
-                    logger.debug(f"UAV {uav.id}: Raw={raw_reward:.2f} (no norm), Pos={uav.pos}, Move={movement_magnitude:.2f}")
+            rewards[uav.id] = self._calculate_reward(uav, uav_assignment[uav.id])
         
         self.episode_steps += 1
         done = self.episode_steps >= self.max_steps
@@ -356,218 +419,57 @@ class DisasterCoverageEnvironment:
         # Get new states
         new_states = {}
         for uav in self.uavs:
-            new_states[uav.id] = self.get_state(uav.id)
+            new_states[uav.id] = self.get_state_RL(uav.id)
         
         return new_states, rewards, done
-    
-    def _get_nearest_zone(self, uav_pos):
-        """Get the nearest disaster zone and distance to it"""
-        nearest_zone = None
-        min_distance = float('inf')
-        
-        for zone in self.disaster_zones:
-            distance = np.sqrt((uav_pos[0] - zone.center[0])**2 + 
-                             (uav_pos[1] - zone.center[1])**2)
-            if distance < min_distance:
-                min_distance = distance
-                nearest_zone = zone
-        
-        return nearest_zone, min_distance
 
-    def _calculate_reward(self, uav, movement_magnitude=0):
-        """Calculate reward for a UAV - progress-based approach"""
-        reward = 0.0
-        
-        # Get nearest zone and current distance
-        nearest_zone, current_distance = self._get_nearest_zone(uav.pos)
-        
-        if nearest_zone:
-            # 1. Strong reward for being IN a disaster zone
-            if current_distance <= nearest_zone.radius:
-                reward += self.config.ZONE_REWARD * nearest_zone.severity * 2.0  # Doubled zone reward
-            else:
-                # 2. Progress-based reward for getting closer to the nearest zone (ONLY when NOT in zone)
-                if uav.prev_distance_to_zone is not None:
-                    delta = uav.prev_distance_to_zone - current_distance
-                    if delta > 0:
-                        reward += delta * 1.5   # Reward for moving toward zone (~300 max at 200m/step)
-                    elif delta < 0:
-                        reward += delta * 1.2   # Penalty for moving away from zone
-            
-            # 3. Update tracker for next step
-            uav.prev_distance_to_zone = current_distance
-        
-        return reward
-    
-    def _update_reward_stats(self, uav_id, reward):
-        """Update reward statistics using Welford's algorithm and EMA for stability"""
-        if uav_id not in self.reward_stats:
-            self.reward_stats[uav_id] = {
-                'count': 0,
-                'mean': 0.0,
-                'std': 1.0,
-                'ema_mean': 0.0,
-                'ema_var': 1.0,
-                'm2': 0.0  # For Welford's algorithm
-            }
+    def _calculate_reward(self, uav, assigned_users):
+        """rᵢ = Σ Shannon(SINR, userⱼ) / n_total  [Mbps] - collision - boundary
 
-        stats = self.reward_stats[uav_id]
-        stats['count'] += 1
-        
-        # Welford's algorithm for numerical stability
-        delta = reward - stats['mean']
-        stats['mean'] += delta / stats['count']
-        delta2 = reward - stats['mean']
-        stats['m2'] += delta * delta2
-        
-        # Update standard deviation
-        if stats['count'] > 1:
-            stats['std'] = max(np.sqrt(stats['m2'] / (stats['count'] - 1)), 1e-8)
-        
-        # EMA updates for non-stationarity handling
-        if stats['count'] == 1:
-            stats['ema_mean'] = reward
-            stats['ema_var'] = 1.0
-        else:
-            # EMA mean update
-            stats['ema_mean'] = self.ema_beta * stats['ema_mean'] + (1 - self.ema_beta) * reward
-            
-            # EMA variance update (using squared error)
-            squared_error = (reward - stats['ema_mean']) ** 2
-            stats['ema_var'] = self.ema_beta * stats['ema_var'] + (1 - self.ema_beta) * squared_error
-    
-    def _normalize_reward(self, uav_id, reward):
-        """Normalize reward using EMA-based statistics with warm-up and clipping"""
-        # Always update stats first
-        self._update_reward_stats(uav_id, reward)
-        
-        # Warm-up: until we have enough samples, return raw reward
-        if (not self.normalize_rewards) or (self.reward_stats[uav_id]['count'] < self.norm_warmup):
-            return reward
-        
-        # Clip raw reward before normalization to handle heavy tails
-        raw_clip_threshold = getattr(self.config, 'RAW_REWARD_CLIP', 1000.0)
-        clipped_reward = np.clip(reward, -raw_clip_threshold, raw_clip_threshold)
-        
-        # Use EMA statistics for normalization (more adaptive to non-stationarity)
-        stats = self.reward_stats[uav_id]
-        ema_std = max(np.sqrt(stats['ema_var']), 1e-8)
-        
-        # Gradual ramp-up to prevent volatile z-scores after warmup
-        ramp_steps = getattr(self.config, 'NORM_RAMP_STEPS', 20)
-        if stats['count'] < self.norm_warmup + ramp_steps:
-            # Linear interpolation from raw reward to normalized reward
-            alpha = (stats['count'] - self.norm_warmup) / ramp_steps
-            raw_normalized = (clipped_reward - stats['ema_mean']) / ema_std
-            normalized = alpha * raw_normalized + (1 - alpha) * clipped_reward
-        else:
-            # Full normalization after ramp-up
-            normalized = (clipped_reward - stats['ema_mean']) / ema_std
-        
-        # Clip to prevent extreme values
-        return float(np.clip(normalized, -self.norm_clip, self.norm_clip))
-    
-    def reset(self):
-        """Reset environment"""
-        num_uavs = len(self.uavs)
-        
-        # Generate random spawn positions
-        start_positions = []
-        for _ in range(num_uavs):
-            x = np.random.uniform(1000, 19000)
-            y = np.random.uniform(1000, 19000)
-            start_positions.append([x, y])
-        
-        for i, uav in enumerate(self.uavs):
-            uav.pos = start_positions[i].copy()
-            uav.battery_level = 100.0
-            # Initialize prev_distance_to_zone for progress-based rewards
-            nearest_zone, current_distance = self._get_nearest_zone(uav.pos)
-            uav.prev_distance_to_zone = current_distance if nearest_zone else None
-        
-        # Recreate disaster zones for training (random)
-        self.disaster_zones = self._create_disaster_zones(deterministic=False)
-        
-        # Reset tracking variables
-        self.total_coverage = 0.0
-        self.episode_steps = 0
-        
-        # Recreate communication links
-        self.sim.drones = self.uavs
-        self.sim.create_links()
-        
-        # Reset reward normalization stats for new episode
-        self._init_per_agent_stats()
-        
-        # Recompute baseline coverage from current positions before returning states
-        drone_positions = [uav.pos for uav in self.uavs]
-        total_coverage = 0.0
-        for zone in self.disaster_zones:
-            coverage = zone.update_coverage(drone_positions)
-            total_coverage += coverage * zone.severity
-        self.total_coverage = total_coverage / len(self.disaster_zones) if self.disaster_zones else 0.0
+        Normalised by n_total so all terms stay in the same [0, ~0.5] Mbps scale,
+        keeping the critic stable. Penalties are scaled the same way.
+        """
+        n_total = max(len(self.ground_users), 1)
+        h_uav   = getattr(self.config, 'UAV_HEIGHT', 100.0)
 
-        # Return initial states
-        initial_states = {}
-        for uav in self.uavs:
-            initial_states[uav.id] = self.get_state(uav.id)
-        
-        return initial_states
-    
-    def get_coverage_metrics(self):
-        """Get current coverage metrics"""
-        metrics = {
-            'total_coverage': self.total_coverage,
-            'zone_coverage': [zone.coverage_status for zone in self.disaster_zones],
-            'uav_positions': [uav.pos for uav in self.uavs],
-            'battery_levels': [uav.battery_level for uav in self.uavs]
-        }
-        return metrics
-    
-    def render(self, save_path=None):
-        """Render the current state of the environment"""
-        import matplotlib.pyplot as plt
-        
-        fig, ax = plt.subplots(figsize=(12, 10))
-        
-        # Plot disaster zones
-        for zone in self.disaster_zones:
-            circle = plt.Circle(zone.center, zone.radius, 
-                              alpha=0.3, color='red' if zone.severity > 0.7 else 'orange')
-            ax.add_patch(circle)
-            
-            # Add severity text
-            ax.text(zone.center[0], zone.center[1], f'S:{zone.severity:.1f}\nC:{zone.coverage_status:.2f}',
-                   ha='center', va='center', fontsize=8)
-        
-        # Plot UAVs
-        colors = ['blue', 'green', 'purple']
-        for i, uav in enumerate(self.uavs):
-            ax.scatter(uav.pos[0], uav.pos[1], c=colors[i], s=100, 
-                      label=f'UAV {i+1} (B:{uav.battery_level:.1f}%)')
-        
-        # Plot communication links
-        if hasattr(self.sim, 'links') and self.sim.links:
-            for link in self.sim.links:
-                pos1 = link.drone1.pos
-                pos2 = link.drone2.pos
-                ax.plot([pos1[0], pos2[0]], [pos1[1], pos2[1]], 'k--', alpha=0.5)
-        
-        ax.set_xlim(0, 20000)
-        ax.set_ylim(0, 20000)
-        ax.set_xlabel('X Position (m)')
-        ax.set_ylabel('Y Position (m)')
-        ax.set_title(f'Disaster Coverage Environment\nTotal Coverage: {self.total_coverage:.3f}')
-        ax.legend()
-        ax.grid(True, alpha=0.3)
-        
-        if save_path:
-            plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        else:
-            plt.show()
-        
-        plt.close()
-    
+        sinr_rate = 0.0
+        if assigned_users:
+            bw_per_user = self.config.BANDWIDTH_PER_UAV / len(assigned_users)
+            for user in assigned_users:
+                d_self  = calculate_distance(user.pos, uav.pos)
+                pl_self = air_to_ground_path_loss(d_self, h_uav, self.config.FREQUENCY)
+                inter_sources_dBm = [
+                    self.config.TRANSMIT_POWER - air_to_ground_path_loss(
+                        calculate_distance(user.pos, o.pos), h_uav, self.config.FREQUENCY,
+                    )
+                    for o in self.uavs if o.id != uav.id
+                ]
+                sinr_lin   = compute_sinr_linear(self.config.TRANSMIT_POWER, pl_self,
+                                                 self.config.NOISE_POWER, inter_sources_dBm)
+                sinr_rate += calculate_shannon_capacity(bw_per_user, sinr_lin)
+        sinr_rate /= (n_total * 1e6)
+
+        collision_dist = getattr(self.config, 'COLLISION_DISTANCE', 100.0)
+        collision_pen  = getattr(self.config, 'COLLISION_PENALTY', 5.0) / n_total
+        collision_penalty = -collision_pen * sum(
+            1 for o in self.uavs if o.id != uav.id
+            and calculate_distance(o.pos, uav.pos) < collision_dist
+        )
+
+        margin       = getattr(self.config, 'BOUNDARY_MARGIN', 50)
+        boundary_pen = getattr(self.config, 'BOUNDARY_PENALTY', 2.0) / n_total
+        near_edge = (
+            uav.pos[0] < margin or uav.pos[0] > self.config.ENV_WIDTH  - margin or
+            uav.pos[1] < margin or uav.pos[1] > self.config.ENV_HEIGHT - margin
+        )
+        boundary_penalty = -boundary_pen if near_edge else 0.0
+
+        return sinr_rate + collision_penalty + boundary_penalty
+
+    @property
+    def global_sum_rate_mbps(self):
+        return compute_global_sum_rate_mbps(self.uavs, self.current_assignment, self.config)
+
     def reset(self, deterministic=False, fixed_positions=None):
         """Reset environment
         
@@ -581,25 +483,33 @@ class DisasterCoverageEnvironment:
             # Use fixed positions for deterministic evaluation
             start_positions = fixed_positions[:num_uavs]
             # Pad with random positions if needed
+            margin = getattr(self.config, 'SPAWN_MARGIN', 100)
             while len(start_positions) < num_uavs:
-                x = np.random.uniform(1000, 19000)
-                y = np.random.uniform(1000, 19000)
-                start_positions.append([x, y])
+                start_positions.append([
+                    np.random.uniform(margin, self.config.ENV_WIDTH  - margin),
+                    np.random.uniform(margin, self.config.ENV_HEIGHT - margin),
+                ])
         else:
-            # Generate random spawn positions
-            start_positions = []
-            for _ in range(num_uavs):
-                x = np.random.uniform(1000, 19000)
-                y = np.random.uniform(1000, 19000)
-                start_positions.append([x, y])
+            margin = getattr(self.config, 'SPAWN_MARGIN', 100)
+            start_positions = [
+                [np.random.uniform(margin, self.config.ENV_WIDTH  - margin),
+                 np.random.uniform(margin, self.config.ENV_HEIGHT - margin)]
+                for _ in range(num_uavs)
+            ]
         
         for i, uav in enumerate(self.uavs):
             uav.pos = start_positions[i].copy()
-            uav.battery_level = 100.0
-            # Initialize prev_distance_to_zone for progress-based rewards
-            nearest_zone, current_distance = self._get_nearest_zone(uav.pos)
-            uav.prev_distance_to_zone = current_distance if nearest_zone else None
-        
+            uav.battery_level = 100.  
+        # Re-randomize zone layout each episode (used for coverage tracking / rendering)
+        if not deterministic:
+            self.disaster_zones = self._create_disaster_zones(deterministic=False)
+
+        # Re-spawn ground users uniformly across the full environment each episode
+        mobile = getattr(self.config, 'GROUND_USERS_MOBILE', False)
+        for user, pos in zip(self.ground_users, self._sample_user_positions(len(self.ground_users))):
+            user.pos = pos
+            user.mobile = mobile
+
         # Reset disaster zones
         for zone in self.disaster_zones:
             zone.coverage_status = 0.0
@@ -607,6 +517,7 @@ class DisasterCoverageEnvironment:
         # Reset tracking variables
         self.total_coverage = 0.0
         self.episode_steps = 0
+        self.current_assignment = {uav.id: [] for uav in self.uavs}
         
         # Recreate communication links
         self.sim.drones = self.uavs
@@ -614,16 +525,14 @@ class DisasterCoverageEnvironment:
         
         # Recompute baseline coverage from current positions before returning states
         drone_positions = [uav.pos for uav in self.uavs]
-        total_coverage = 0.0
-        for zone in self.disaster_zones:
-            coverage = zone.update_coverage(drone_positions)
-            total_coverage += coverage * zone.severity
-        self.total_coverage = total_coverage / len(self.disaster_zones) if self.disaster_zones else 0.0
+        self.total_coverage = sum(
+            zone.update_coverage(drone_positions) for zone in self.disaster_zones
+        ) / len(self.disaster_zones) if self.disaster_zones else 0.0
 
         # Return initial states
         initial_states = {}
         for uav in self.uavs:
-            initial_states[uav.id] = self.get_state(uav.id)
+            initial_states[uav.id] = self.get_state_RL(uav.id)
         
         return initial_states
     
@@ -633,10 +542,86 @@ class DisasterCoverageEnvironment:
             'total_coverage': self.total_coverage,
             'zone_coverage': [zone.coverage_status for zone in self.disaster_zones],
             'uav_positions': [uav.pos for uav in self.uavs],
-            'battery_levels': [uav.battery_level for uav in self.uavs]
+            'battery_levels': [uav.battery_level for uav in self.uavs],
+            'ground_user_positions': [user.pos for user in self.ground_users],
         }
         return metrics
     
+    def get_coms_metrics(self, uav_users, fl_model_bytes=None):
+        """Per-UAV and global comms metrics for the FL simulation task.
+
+        Args:
+            uav_users: dict {uav_index: [GroundUser, ...]} — current user assignment
+            fl_model_bytes: optional model size in bytes; when provided, includes
+                            an estimate of FL uplink transmission time per UAV
+
+        Returns a dict with:
+          'per_uav'  — one entry per UAV with channel quality and bandwidth info
+          'global_*' — aggregates across all UAVs / users useful as training context
+        """
+        B_total = self.config.BANDWIDTH_PER_UAV
+        alpha   = getattr(self.config, 'B_USERS_FRACTION', 0.7)
+        B_FL    = (1 - alpha) * B_total
+        h_uav   = getattr(self.config, 'UAV_HEIGHT', 100.0)
+        freq    = self.config.FREQUENCY
+        P_tx    = self.config.TRANSMIT_POWER
+        N_0     = self.config.NOISE_POWER
+
+        all_rates = []
+        all_plos  = []
+        per_uav   = []
+
+        for i, uav in enumerate(self.uavs):
+            served      = uav_users.get(i, [])
+            n_users     = len(served)
+            per_user_bw = (alpha * B_total / n_users) if n_users > 0 else 0.0
+
+            user_rates, sinrs_db, plos_vals = [], [], []
+
+            for user in served:
+                d_2d = calculate_distance(user.pos, uav.pos)
+                pl   = air_to_ground_path_loss(d_2d, h_uav, freq)
+                p    = prob_los(d_2d, h_uav)
+                sinr = P_tx - pl - N_0          # dB
+                rate = uav_to_user_rate(d_2d, h_uav, freq, per_user_bw, P_tx, N_0)
+                user_rates.append(rate)
+                sinrs_db.append(sinr)
+                plos_vals.append(p)
+
+            all_rates.extend(user_rates)
+            all_plos.extend(plos_vals)
+
+            entry = {
+                'uav_id':            uav.id,
+                'uav_pos':           list(uav.pos),
+                'battery':           uav.battery_level,
+                'n_users':           n_users,
+                'B_users':           per_user_bw * n_users,
+                'B_FL':              B_FL,
+                'user_rates_bps':    user_rates,
+                'avg_user_rate_bps': float(np.mean(user_rates)) if user_rates else 0.0,
+                'sinr_dB':           sinrs_db,
+                'avg_sinr_dB':       float(np.mean(sinrs_db)) if sinrs_db else 0.0,
+                'plos':              plos_vals,
+                'avg_plos':          float(np.mean(plos_vals)) if plos_vals else 0.0,
+            }
+
+            if fl_model_bytes is not None:
+                entry['fl_tx_time_s'] = (fl_model_bytes * 8) / B_FL if B_FL > 0 else float('inf')
+
+            per_uav.append(entry)
+
+        return {
+            'per_uav':             per_uav,
+            'global_avg_rate_bps': float(np.mean(all_rates)) if all_rates else 0.0,
+            'global_avg_plos':     float(np.mean(all_plos))  if all_plos  else 0.0,
+            'global_throughput_bps': float(np.sum(all_rates)),
+            'zone_coverage':       [z.coverage_status for z in self.disaster_zones],
+            'total_coverage':      self.total_coverage,
+            'B_FL_per_uav':        B_FL,
+            'B_users_total':       alpha * B_total,
+        }
+
     def render(self, save_path=None):
         """Render the current state of the environment"""
         import matplotlib.pyplot as plt
@@ -653,6 +638,12 @@ class DisasterCoverageEnvironment:
             ax.text(zone.center[0], zone.center[1], f'S:{zone.severity:.1f}\nC:{zone.coverage_status:.2f}',
                    ha='center', va='center', fontsize=8)
         
+        # Plot ground users
+        if self.ground_users:
+            gx = [u.pos[0] for u in self.ground_users]
+            gy = [u.pos[1] for u in self.ground_users]
+            ax.scatter(gx, gy, c='black', s=30, marker='^', label='Ground users', zorder=3)
+
         # Plot UAVs
         colors = ['blue', 'green', 'purple']
         for i, uav in enumerate(self.uavs):
@@ -666,8 +657,8 @@ class DisasterCoverageEnvironment:
                 pos2 = link.drone2.pos
                 ax.plot([pos1[0], pos2[0]], [pos1[1], pos2[1]], 'k--', alpha=0.5)
         
-        ax.set_xlim(0, 20000)
-        ax.set_ylim(0, 20000)
+        ax.set_xlim(0, self.config.ENV_WIDTH)
+        ax.set_ylim(0, self.config.ENV_HEIGHT)
         ax.set_xlabel('X Position (m)')
         ax.set_ylabel('Y Position (m)')
         ax.set_title(f'Disaster Coverage Environment\nTotal Coverage: {self.total_coverage:.3f}')
@@ -703,42 +694,33 @@ class DisasterCoverageEnvironment:
         for i in range(num_uavs):
             # Use seed-based deterministic positioning
             np.random.seed(seed + i)  # Different seed for each UAV
-            x = np.random.uniform(1000, 19000)
-            y = np.random.uniform(1000, 19000)
+            margin = getattr(self.config, 'SPAWN_MARGIN', 100)
+            x = np.random.uniform(margin, self.config.ENV_WIDTH  - margin)
+            y = np.random.uniform(margin, self.config.ENV_HEIGHT - margin)
             fixed_positions.append([x, y])
         
         # Reset with deterministic positioning
         states = self.reset(deterministic=True, fixed_positions=fixed_positions)
-        total_reward = 0.0
-        total_coverage = 0.0
-        
+        total_reward   = 0.0
+        total_sum_rate = 0.0
+
         for step in range(self.config.EPISODE_LENGTH):
             actions = {}
             for agent_id, agent in agents.items():
                 if agent_id in states:
-                    # CORRECT: Use explore=False for honest evaluation
-                    action = agent.select_action(states[agent_id], explore=False, noise_scale=0.0)  # NO NOISE
+                    action = agent.select_action(states[agent_id], explore=False, noise_scale=0.0)
                     actions[agent_id] = action
-            
+
             new_states, rewards, done = self.step(actions)
-            
-            # Calculate coverage
-            drone_positions = [uav.pos for uav in self.uavs]
-            total_coverage_step = 0.0
-            for zone in self.disaster_zones:
-                coverage = zone.update_coverage(drone_positions)
-                total_coverage_step += coverage * zone.severity
-            avg_coverage_step = total_coverage_step / len(self.disaster_zones) if self.disaster_zones else 0.0
-            
-            total_reward += np.mean(list(rewards.values()))
-            total_coverage += avg_coverage_step
+            total_reward   += np.mean(list(rewards.values()))
+            total_sum_rate += self.global_sum_rate_mbps
             states = new_states
-        
-        avg_reward = total_reward / self.config.EPISODE_LENGTH
-        avg_coverage = total_coverage / self.config.EPISODE_LENGTH
-        
+
+        avg_reward   = total_reward   / self.config.EPISODE_LENGTH
+        avg_sum_rate = total_sum_rate / self.config.EPISODE_LENGTH
+
         print(f"{eval_name} Results:")
-        print(f"  Average Reward: {avg_reward:.2f}")
-        print(f"  Average Coverage: {avg_coverage:.3f}")
-        
-        return avg_reward, avg_coverage
+        print(f"  Average Reward:   {avg_reward:.2f}")
+        print(f"  Avg Sum Rate:     {avg_sum_rate:.2f} Mbps")
+
+        return avg_reward, avg_sum_rate

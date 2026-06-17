@@ -12,10 +12,9 @@ class Drone:
         self.pos[1] += step[1]
         
 
-class Operator:
-    def __init__(self, position=[0,0]):
-        self.pos = position  # Operator is stationary
-        self.received_power=0
-
+class BaseStation:
+    def __init__(self, position=[0, 0]):
+        self.pos = position
+        self.received_power = 0
 
 

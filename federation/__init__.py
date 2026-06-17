@@ -1,3 +1,2 @@
-"""Federated RL components (Flower clients/strategies will land here)."""
-
-
+"""Federated RL components."""
+from federation.gossip import actor_gossip_step
