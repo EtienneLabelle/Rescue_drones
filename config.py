@@ -97,3 +97,53 @@ class Config:
     FL_LEARNING_RATE = 0.01      # SGD learning rate for FL clients
     FL_LOCAL_SAMPLES = 200       # local training samples per UAV/client
     LINEAR_REGRESSION_DIM = 8   # feature dimension for the FL linear-regression task (fedavg path)
+
+    # -----------------------------------------------------------------------
+    # RL-for-FL: UAV relay optimises a federated learning workload (main.py)
+    # -----------------------------------------------------------------------
+
+    # FL workload
+    N_CLIENTS               = 10
+    FL_TARGET_EPS           = 0.05      # loss threshold that ends an episode
+    FL_THETA                = 0.5       # local accuracy param for convergence bound
+    FL_XI                   = 2.0       # K(eps,theta) = xi * log(1/eps) / (1-theta)
+    FL_MAX_ROUNDS           = 100       # hard episode cap (rounds)
+    CLIENT_MODEL_SIZE_BYTES = 4096      # bytes per model update (TinyMLP @ float32)
+    CLIENT_FLOPS_PER_SEC    = 1e9       # client compute throughput (FLOP/s)
+
+    # Base station (FL aggregator) — default placed at right edge, mid-height
+    BS_POSITION             = None      # None → [ENV_WIDTH, ENV_HEIGHT/2] at runtime
+
+    # UAV relay
+    UAV_RELAY_H             = 100.0     # relay altitude (m) — same as UAV_HEIGHT
+    UAV_ENERGY_BUDGET       = 5000.0    # J per episode
+
+    # Backhaul channel
+    BACKHAUL_RICIAN_K       = 3.0       # Rician K-factor for UAV↔BS link
+
+    # Rotary-wing propulsion (hover model)
+    PROPULSION_P0           = 100.0     # W  blade profile power
+    PROPULSION_Pi           = 120.0     # W  induced power
+
+    # Reward shaping
+    RHO                     = 0.5       # weight: (1-rho)*energy + rho*latency
+    ACCURACY_GAIN_W         = 1.0       # weight on accuracy gain term
+    STALENESS_PENALTY_W     = 0.01      # penalise high staleness variance
+    FL_BOUNDARY_PENALTY     = 0.1       # penalty when UAV near map edge
+    UNREACHABLE_PENALTY     = 0.05      # penalty per unselected client fraction
+    REWARD_MAX_ENERGY       = 500.0     # J  — normalisation reference
+    REWARD_MAX_LATENCY      = 60.0      # s  — normalisation reference
+
+    # PPO hyperparameters
+    PPO_LR                  = 3e-4
+    PPO_CLIP                = 0.2
+    PPO_GAMMA               = 0.99
+    PPO_GAE_LAMBDA          = 0.95
+    PPO_ENTROPY_COEF        = 0.01
+    PPO_EPOCHS              = 4
+    PPO_BATCH_SIZE          = 64
+    PPO_HIDDEN_DIM          = 256
+
+    # Training loop (main.py)
+    FL_RL_TRAIN_EPISODES    = 500
+    FL_RL_EVAL_EVERY        = 50

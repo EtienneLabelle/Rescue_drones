@@ -1,11 +1,13 @@
-# env.py       
+# env.py
+import math
 import random
 import numpy as np
 from coms import (Link, prob_los, air_to_ground_path_loss, uav_to_user_rate,
                   calculate_shannon_capacity, compute_global_sum_rate_mbps,
-                  compute_snr_linear, compute_sinr_linear, linear_to_dBm)
+                  compute_snr_linear, compute_sinr_linear, linear_to_dBm,
+                  dBm_to_linear, fspl_db)
 from utils import calculate_distance
-from drones import Drone
+from drones import Drone, BaseStation
 from config import Config
 import torch
 
@@ -724,3 +726,225 @@ class DisasterCoverageEnvironment:
         print(f"  Avg Sum Rate:     {avg_sum_rate:.2f} Mbps")
 
         return avg_reward, avg_sum_rate
+
+
+# ==========================================================================
+# RL-for-FL: FLRelayEnvironment
+# ==========================================================================
+
+class FLRelayEnvironment:
+    """Single-UAV relay environment for optimising a federated learning workload.
+
+    One RL step  = one FL round.
+    One episode  = an FL run from scratch until loss < FL_TARGET_EPS or max rounds.
+
+    State  (dim = 2·N + 5):
+        uav_x/W, uav_y/H,
+        uplink_rate_i/ref  × N  (per-client A2G quality),
+        backhaul_rate/ref,
+        fl_loss_normalised,
+        staleness_i/max    × N  (rounds since last participation),
+        energy_remaining/budget
+
+    Action (dim = 2 + 2·N, all raw from actor):
+        dx, dy                — continuous displacement (tanh-squashed)
+        sel_0 … sel_{N-1}     — Bernoulli samples {0,1}; 1 = client selected
+                                 FLAGGED: relaxed from discrete combinatorial
+        bw_0 … bw_{N-1}       — raw Gaussian logits; env applies softmax
+    """
+
+    def __init__(self, config, fl_workload, fixed_uav: bool = False):
+        self.config     = config
+        self.fl         = fl_workload
+        self.fixed_uav  = fixed_uav
+
+        self.n_clients  = fl_workload.n_clients
+        self.state_dim  = 2 * self.n_clients + 5
+        self.action_dim = 2 * self.n_clients + 2
+
+        # UAV relay
+        self.uav = Drone(
+            id="uav_relay",
+            position=[config.ENV_WIDTH / 2.0, config.ENV_HEIGHT / 2.0],
+        )
+
+        # Fixed BS (FL aggregator) at periphery
+        bs_pos = getattr(config, 'BS_POSITION', None) or \
+                 [float(config.ENV_WIDTH), config.ENV_HEIGHT / 2.0]
+        self.bs = BaseStation(position=list(bs_pos))
+
+        self.energy_budget    = getattr(config, 'UAV_ENERGY_BUDGET', 5000.0)
+        self.energy_remaining = self.energy_budget
+        self.current_loss     = 1.0
+        self.done             = False
+
+        # Normalisation references
+        self._ref_uplink = 1e7   # 10 Mbps
+        self._ref_bh     = 1e8   # 100 Mbps
+        self._ref_stale  = max(getattr(config, 'FL_MAX_ROUNDS', 100), 1)
+
+    # ------------------------------------------------------------------
+    # Gym-style interface
+    # ------------------------------------------------------------------
+
+    def reset(self, seed: int = None) -> np.ndarray:
+        self.fl.reset(seed)
+
+        margin = getattr(self.config, 'SPAWN_MARGIN', 100)
+        rng    = np.random.default_rng(seed)
+
+        if self.fixed_uav:
+            self.uav.pos = [self.config.ENV_WIDTH / 2.0, self.config.ENV_HEIGHT / 2.0]
+        else:
+            self.uav.pos = [
+                float(rng.uniform(margin, self.config.ENV_WIDTH  - margin)),
+                float(rng.uniform(margin, self.config.ENV_HEIGHT - margin)),
+            ]
+
+        self.energy_remaining = self.energy_budget
+        self.current_loss     = 1.0
+        self.done             = False
+        return self._get_state()
+
+    def step(self, action: np.ndarray):
+        """Execute one FL round.
+
+        action layout: [dx, dy, sel_0..N-1, bw_0..N-1]
+          dx, dy      — in [-1,1]; scaled by UAV_MAX_STEP
+          sel_i       — Bernoulli {0,1}; 1 = selected
+          bw_i        — raw Gaussian logits; softmax applied here
+        """
+        N = self.n_clients
+        dx_raw  = float(action[0])
+        dy_raw  = float(action[1])
+        sel_bin = action[2:2 + N]           # {0, 1}
+        bw_raw  = action[2 + N:2 + 2 * N]  # Gaussian logits
+
+        # ---- Move UAV ------------------------------------------------
+        if not self.fixed_uav:
+            max_step = getattr(self.config, 'UAV_MAX_STEP', 20)
+            self.uav.pos[0] = float(np.clip(
+                self.uav.pos[0] + dx_raw * max_step, 0, self.config.ENV_WIDTH))
+            self.uav.pos[1] = float(np.clip(
+                self.uav.pos[1] + dy_raw * max_step, 0, self.config.ENV_HEIGHT))
+
+        # ---- Client selection: Bernoulli sample > 0.5 ----------------
+        # FLAGGED: relaxed from discrete combinatorial to continuous threshold.
+        selected_ids = [i for i in range(N) if sel_bin[i] > 0.5]
+        if not selected_ids:
+            selected_ids = [0]  # always pick at least one client
+
+        # ---- Bandwidth: softmax over selected clients ----------------
+        bw_alloc = np.zeros(N, dtype=np.float32)
+        bw_sel   = bw_raw[[i for i in selected_ids]]
+        bw_soft  = np.exp(bw_sel - bw_sel.max())
+        bw_soft /= bw_soft.sum()
+        for idx, cid in enumerate(selected_ids):
+            bw_alloc[cid] = float(bw_soft[idx])
+
+        # ---- FL round (analytical cost model) -----------------------
+        result = self.fl.run_round_analytical(
+            selected_ids, bw_alloc,
+            list(self.uav.pos), list(self.bs.pos),
+            self.config,
+        )
+        energy_round  = result['energy_J']
+        latency_round = result['latency_s']
+        accuracy_gain = result['accuracy_gain']
+
+        self.energy_remaining = max(0.0, self.energy_remaining - energy_round)
+
+        # ---- Reward --------------------------------------------------
+        rho      = getattr(self.config, 'RHO', 0.5)
+        w_acc    = getattr(self.config, 'ACCURACY_GAIN_W', 1.0)
+        e_ref    = getattr(self.config, 'REWARD_MAX_ENERGY',  500.0)
+        l_ref    = getattr(self.config, 'REWARD_MAX_LATENCY',  60.0)
+
+        e_norm = energy_round  / max(e_ref, 1e-9)
+        l_norm = latency_round / max(l_ref, 1e-9)
+        reward = -(1.0 - rho) * e_norm - rho * l_norm + w_acc * accuracy_gain
+
+        # Boundary penalty
+        margin   = getattr(self.config, 'BOUNDARY_MARGIN', 50)
+        near_edge = (
+            self.uav.pos[0] < margin or
+            self.uav.pos[0] > self.config.ENV_WIDTH  - margin or
+            self.uav.pos[1] < margin or
+            self.uav.pos[1] > self.config.ENV_HEIGHT - margin
+        )
+        if near_edge:
+            reward -= getattr(self.config, 'FL_BOUNDARY_PENALTY', 0.1)
+
+        # Staleness variance penalty (encourages fair participation)
+        stale_var = float(np.var(self.fl.staleness))
+        reward   -= getattr(self.config, 'STALENESS_PENALTY_W', 0.01) * stale_var
+
+        # Unselected-client penalty
+        reward -= getattr(self.config, 'UNREACHABLE_PENALTY', 0.05) * \
+                  (N - len(selected_ids)) / N
+
+        # ---- FL progress (proxy loss estimate) ----------------------
+        K_total           = max(self.fl.rounds_to_eps(), 1.0)
+        progress          = min(self.fl.round / K_total, 1.0)
+        self.current_loss = max(1.0 - progress, 0.0)
+
+        # ---- Done ---------------------------------------------------
+        eps        = getattr(self.config, 'FL_TARGET_EPS',  0.05)
+        max_rounds = getattr(self.config, 'FL_MAX_ROUNDS', 100)
+        self.done  = (
+            self.current_loss < eps or
+            self.fl.round    >= max_rounds or
+            self.energy_remaining <= 0.0
+        )
+
+        info = dict(
+            energy_round=energy_round,
+            latency_round=latency_round,
+            accuracy_gain=accuracy_gain,
+            selected_ids=selected_ids,
+            fl_round=self.fl.round,
+            fl_loss=self.current_loss,
+        )
+        return self._get_state(), float(reward), self.done, info
+
+    # ------------------------------------------------------------------
+    # State builder
+    # ------------------------------------------------------------------
+
+    def _get_state(self) -> np.ndarray:
+        N    = self.n_clients
+        h    = getattr(self.config, 'UAV_RELAY_H', getattr(self.config, 'UAV_HEIGHT', 100.0))
+        freq = self.config.FREQUENCY
+        P_tx = self.config.TRANSMIT_POWER
+        N_0  = self.config.NOISE_POWER
+        bw   = getattr(self.config, 'BANDWIDTH_PER_UAV', 1e6)
+
+        s = [
+            self.uav.pos[0] / self.config.ENV_WIDTH,
+            self.uav.pos[1] / self.config.ENV_HEIGHT,
+        ]
+
+        # Per-client uplink rate (normalised)
+        for c in self.fl.clients:
+            d2d  = calculate_distance(c.pos, self.uav.pos)
+            rate = uav_to_user_rate(d2d, h, freq, bw / N, P_tx, N_0)
+            s.append(float(np.clip(rate / self._ref_uplink, 0.0, 1.0)))
+
+        # Backhaul UAV↔BS (normalised)
+        d_bs    = calculate_distance(self.uav.pos, self.bs.pos)
+        pl_bs   = fspl_db(max(d_bs, 1.0), freq)
+        snr_lin = dBm_to_linear(P_tx - pl_bs - N_0)
+        bh_rate = calculate_shannon_capacity(bw, snr_lin)
+        s.append(float(np.clip(bh_rate / self._ref_bh, 0.0, 1.0)))
+
+        # FL progress proxy
+        s.append(float(np.clip(self.current_loss, 0.0, 1.0)))
+
+        # Per-client staleness (normalised)
+        for i in range(N):
+            s.append(float(np.clip(self.fl.staleness[i] / self._ref_stale, 0.0, 1.0)))
+
+        # Remaining energy fraction
+        s.append(float(np.clip(self.energy_remaining / self.energy_budget, 0.0, 1.0)))
+
+        return np.array(s, dtype=np.float32)

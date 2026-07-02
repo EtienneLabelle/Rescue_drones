@@ -785,4 +785,255 @@ def create_rl_agent(agent_type, state_dim, action_dim, **kwargs):
         return MADDPGAgent(kwargs.pop('agent_id'), state_dim, action_dim,
                            kwargs.pop('num_agents'), **kwargs)
 
+    if agent_type == 'hybrid_ppo':
+        if 'n_clients' not in kwargs:
+            raise ValueError("HybridPPOAgent requires 'n_clients'")
+        return HybridPPOAgent(state_dim, kwargs.pop('n_clients'), **kwargs)
+
     return registry[agent_type](state_dim, action_dim, **kwargs)
+
+
+# ===========================================================================
+# RL-for-FL: multi-head PPO for the UAV relay problem
+# ===========================================================================
+
+class HybridPPOActor(nn.Module):
+    """Multi-head actor: displacement (Gaussian+tanh), selection (Bernoulli),
+    bandwidth (Gaussian logits; env applies softmax).
+
+    Action stored in trajectory:
+        [dx, dy (tanh-squashed),  sel_0..N-1 ({0,1}),  bw_0..N-1 (Gaussian raw)]
+
+    NOTE: client selection is a RELAXED continuous approximation of the true
+    discrete combinatorial head.  The actor outputs Bernoulli logits; the env
+    thresholds at sigmoid > 0.5.  Full discrete selection would require
+    REINFORCE-over-subsets, deferred to a future pass.
+    """
+
+    def __init__(self, state_dim: int, n_clients: int, hidden_dim: int = 256):
+        super().__init__()
+        self.n_clients = n_clients
+
+        self.trunk = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim), nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim), nn.ReLU(),
+        )
+
+        # Displacement head — Gaussian mean, tanh-squashed to [-1, 1]
+        self.disp_mean    = nn.Linear(hidden_dim, 2)
+        self.disp_log_std = nn.Parameter(torch.zeros(2) - 0.5)
+
+        # Selection head — Bernoulli logits → sample {0, 1}
+        self.sel_head = nn.Linear(hidden_dim, n_clients)
+
+        # Bandwidth head — Gaussian logits; softmax applied in env
+        self.bw_mean    = nn.Linear(hidden_dim, n_clients)
+        self.bw_log_std = nn.Parameter(torch.zeros(n_clients) - 0.5)
+
+        # Orthogonal init for trunk; small gain for output layers
+        for m in self.trunk.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.orthogonal_(m.weight, gain=np.sqrt(2))
+                nn.init.zeros_(m.bias)
+        for layer in (self.disp_mean, self.sel_head, self.bw_mean):
+            nn.init.orthogonal_(layer.weight, gain=0.01)
+            nn.init.zeros_(layer.bias)
+
+    def _trunk(self, x: torch.Tensor) -> torch.Tensor:
+        return self.trunk(x)
+
+    def get_action_and_logprob(self, x: torch.Tensor):
+        """Sample action and return (action_tensor, log_prob_scalar)."""
+        h = self._trunk(x)
+
+        # Displacement — Normal + tanh squash
+        d_mean = self.disp_mean(h)
+        d_std  = self.disp_log_std.clamp(-4, 2).exp()
+        d_dist = torch.distributions.Normal(d_mean, d_std)
+        d_raw  = d_dist.rsample()
+        d_act  = torch.tanh(d_raw)
+        lp_d   = (d_dist.log_prob(d_raw)
+                  - torch.log(1.0 - d_act.pow(2) + 1e-6)).sum(-1)
+
+        # Selection — Bernoulli
+        sel_logits = self.sel_head(h)
+        sel_dist   = torch.distributions.Bernoulli(logits=sel_logits)
+        sel_act    = sel_dist.sample()
+        lp_s       = sel_dist.log_prob(sel_act).sum(-1)
+
+        # Bandwidth — Gaussian logits (softmax handled in env)
+        b_mean = self.bw_mean(h)
+        b_std  = self.bw_log_std.clamp(-4, 2).exp()
+        b_dist = torch.distributions.Normal(b_mean, b_std)
+        b_raw  = b_dist.rsample()
+        lp_b   = b_dist.log_prob(b_raw).sum(-1)
+
+        log_prob = lp_d + lp_s + lp_b
+        action   = torch.cat([d_act, sel_act, b_raw], dim=-1)
+        return action, log_prob
+
+    def log_prob_of(self, x: torch.Tensor, action: torch.Tensor):
+        """Recompute log_prob + entropy for a stored (state, action) batch."""
+        N = self.n_clients
+        h = self._trunk(x)
+
+        d_act   = action[:, :2]
+        sel_act = action[:, 2:2 + N]
+        b_raw   = action[:, 2 + N:]
+
+        # Displacement
+        d_mean  = self.disp_mean(h)
+        d_std   = self.disp_log_std.clamp(-4, 2).exp()
+        d_dist  = torch.distributions.Normal(d_mean, d_std)
+        d_raw   = torch.atanh(d_act.clamp(-0.9999, 0.9999))
+        lp_d    = (d_dist.log_prob(d_raw)
+                   - torch.log(1.0 - d_act.pow(2) + 1e-6)).sum(-1)
+        ent_d   = d_dist.entropy().sum(-1)
+
+        # Selection
+        sel_logits = self.sel_head(h)
+        sel_dist   = torch.distributions.Bernoulli(logits=sel_logits)
+        lp_s       = sel_dist.log_prob(sel_act).sum(-1)
+        ent_s      = sel_dist.entropy().sum(-1)
+
+        # Bandwidth
+        b_mean = self.bw_mean(h)
+        b_std  = self.bw_log_std.clamp(-4, 2).exp()
+        b_dist = torch.distributions.Normal(b_mean, b_std)
+        lp_b   = b_dist.log_prob(b_raw).sum(-1)
+        ent_b  = b_dist.entropy().sum(-1)
+
+        return lp_d + lp_s + lp_b, ent_d + ent_s + ent_b
+
+
+class HybridPPOAgent(BaseRLAgent):
+    """Single-agent PPO for UAV-relay FL optimisation.
+
+    Uses GAE for advantage estimation and clipped surrogate objective.
+    Trajectory is collected for a full episode then updated in mini-batches.
+    """
+
+    def __init__(self, state_dim: int, n_clients: int,
+                 learning_rate: float = 3e-4,
+                 gamma: float = 0.99, gae_lambda: float = 0.95,
+                 clip_ratio: float = 0.2, value_coef: float = 0.5,
+                 entropy_coef: float = 0.01, ppo_epochs: int = 4,
+                 batch_size: int = 64, hidden_dim: int = 256):
+        action_dim = 2 + 2 * n_clients
+        super().__init__(state_dim, action_dim, learning_rate)
+        self.n_clients   = n_clients
+        self.gamma       = gamma
+        self.gae_lambda  = gae_lambda
+        self.clip_ratio  = clip_ratio
+        self.value_coef  = value_coef
+        self.entropy_coef = entropy_coef
+        self.ppo_epochs  = ppo_epochs
+        self.batch_size  = batch_size
+
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        self.actor  = HybridPPOActor(state_dim, n_clients, hidden_dim).to(self.device)
+        self.critic = PPOCritic(state_dim, hidden_dim).to(self.device)
+
+        self.optimizer = optim.Adam(
+            list(self.actor.parameters()) + list(self.critic.parameters()),
+            lr=learning_rate,
+        )
+
+        self.trajectory: list = []
+
+    # ------ action selection ------
+
+    def select_action(self, state: np.ndarray):
+        """Returns (action_np, log_prob_float, value_float)."""
+        s = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+        with torch.no_grad():
+            action_t, lp_t = self.actor.get_action_and_logprob(s)
+            value_t        = self.critic(s)
+        return (
+            action_t.squeeze(0).cpu().numpy(),
+            float(lp_t.item()),
+            float(value_t.item()),
+        )
+
+    def store(self, state, action, log_prob, reward, done, value):
+        self.trajectory.append((state, action, log_prob, reward, done, value))
+
+    # ------ PPO update ------
+
+    def update(self) -> dict:
+        if not self.trajectory:
+            return {}
+
+        states   = torch.FloatTensor(np.array([t[0] for t in self.trajectory])).to(self.device)
+        actions  = torch.FloatTensor(np.array([t[1] for t in self.trajectory])).to(self.device)
+        old_lps  = torch.FloatTensor([t[2] for t in self.trajectory]).to(self.device)
+        rewards  = [t[3] for t in self.trajectory]
+        dones    = [t[4] for t in self.trajectory]
+        values   = [t[5] for t in self.trajectory]
+
+        # ---- GAE advantage estimation ----
+        advantages, returns = [], []
+        gae = 0.0
+        next_val = 0.0
+        for i in reversed(range(len(rewards))):
+            mask     = 0.0 if dones[i] else 1.0
+            delta    = rewards[i] + self.gamma * next_val * mask - values[i]
+            gae      = delta + self.gamma * self.gae_lambda * mask * gae
+            advantages.insert(0, gae)
+            returns.insert(0, gae + values[i])
+            next_val = values[i]
+
+        advantages = torch.FloatTensor(advantages).to(self.device)
+        returns    = torch.FloatTensor(returns).to(self.device)
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+        # ---- PPO mini-batch updates ----
+        T = len(self.trajectory)
+        logs: dict[str, list] = dict(actor_loss=[], critic_loss=[], entropy=[])
+
+        for _ in range(self.ppo_epochs):
+            idx = torch.randperm(T)
+            for start in range(0, T, self.batch_size):
+                mb      = idx[start:start + self.batch_size]
+                new_lps, entropy = self.actor.log_prob_of(states[mb], actions[mb])
+                ratio   = torch.exp(new_lps - old_lps[mb])
+
+                adv_mb  = advantages[mb]
+                surr1   = ratio * adv_mb
+                surr2   = torch.clamp(ratio, 1 - self.clip_ratio, 1 + self.clip_ratio) * adv_mb
+                a_loss  = -torch.min(surr1, surr2).mean()
+
+                v_pred  = self.critic(states[mb]).squeeze(-1)
+                c_loss  = nn.MSELoss()(v_pred, returns[mb])
+
+                loss = a_loss + self.value_coef * c_loss - self.entropy_coef * entropy.mean()
+                self.optimizer.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(
+                    list(self.actor.parameters()) + list(self.critic.parameters()), 0.5)
+                self.optimizer.step()
+
+                logs['actor_loss'].append(float(a_loss.item()))
+                logs['critic_loss'].append(float(c_loss.item()))
+                logs['entropy'].append(float(entropy.mean().item()))
+
+        self.trajectory = []
+        return {k: float(np.mean(v)) for k, v in logs.items()}
+
+    # ------ BaseRLAgent abstract methods ------
+
+    def save_model(self, path: str):
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        torch.save({
+            'actor':     self.actor.state_dict(),
+            'critic':    self.critic.state_dict(),
+            'optimizer': self.optimizer.state_dict(),
+            'n_clients': self.n_clients,
+        }, path)
+
+    def load_model(self, path: str):
+        ckpt = torch.load(path, map_location=self.device)
+        self.actor.load_state_dict(ckpt['actor'])
+        self.critic.load_state_dict(ckpt['critic'])
+        self.optimizer.load_state_dict(ckpt['optimizer'])

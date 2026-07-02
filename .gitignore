@@ -10,3 +10,4 @@ log/
 runs/
 .DS_Store
 models/
+results/
